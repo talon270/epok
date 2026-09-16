@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en" data-theme="quasar" data-mode="dark">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>epok</title>
+<meta name="color-scheme" content="dark light">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="stylesheet" href="css/brutal.css">
+<link rel="stylesheet" href="css/themes.css">
+<link rel="stylesheet" href="css/views.css">
+<link rel="stylesheet" href="css/print.css" media="print">
+</head>
+<body>
+
+<!-- Owner: Window A. Load order is frozen in CONTRACTS.md § Load order.
+     A module may call anything loaded before it, never after. -->
+
+<!-- Banners sit above the shell, not inside it: a state the user must keep
+     seeing does not belong in a scrolling column. -->
+<div id="banners"></div>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="Sections"><!-- built by Epok.registerView --></nav>
+  <main class="main" id="main"><!-- views mount here --></main>
+</div>
+
+<div id="toasts" aria-live="polite"></div>
+
+<script src="js/core.js"></script>
+<script src="js/storage.js"></script>
+<script src="js/crypto.js"></script>
+<script src="js/tags.data.js"></script>
+<script src="js/contraception.data.js"></script>
+<script src="js/model.js"></script>
+<script src="js/backtest.js"></script>
+<script src="js/import-clue.js"></script>
+<script src="js/reminders.js"></script>
+<script src="js/views/today.js"></script>
+<script src="js/views/calendar.js"></script>
+<script src="js/views/insights.js"></script>
+<script src="js/views/settings.js"></script>
+<script src="js/views/report.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

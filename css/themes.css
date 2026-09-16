@@ -1,0 +1,181 @@
+/* ==========================================================================
+   EPOK · THEMES
+   Owner: Window A.
+
+     · PALETTES  quasar, arasaka, chernobyl, monolith — from ../../Themes/*.txt
+     · TWINS     each dark palette gets a derived light counterpart
+     · CONTRAST  AA 4.5:1 body, 3:1 large and UI lines, asserted by tools/verify.py
+                 A palette that fails does not ship.
+
+   Structure. Each palette declares its own values twice — `-d` for dark, `-l`
+   for light — and three generic mapping blocks bind one set to the live
+   tokens. That indirection is why the dark values are written once instead of
+   three times, and why no colour has its only definition inside a media query:
+
+     :root                                       -> light   (nothing stamped, light preference)
+     :root[data-mode="dark"]                     -> dark    (explicit choice wins)
+     @media dark + :root:not([data-mode="light"])-> dark    (system preference)
+
+   Source palettes are all pure-black dark (isDark true, background 000000).
+   The light twins are derived here and contrast-checked, because derivation is
+   exactly where contrast quietly fails.
+   ========================================================================== */
+
+/* ==========================================================================
+   PALETTE · QUASAR — pink FF4081
+   Dark accent is the source hex; the light accent is darkened to C2185B
+   because FF4081 on white is 3.35:1 and fails AA body text.
+   ========================================================================== */
+:root[data-theme="quasar"] {
+  --p-bg-d: #000000;  --p-surface-d: #0A0A0A;  --p-surface2-d: #161014;
+  --p-line-d: #2E2027; --p-line-strong-d: #6E6068;
+  --p-fg-d: #FCE4EC;  --p-fg-dim-d: #C898A8;   --p-fg-faint-d: #93777F;
+  --p-accent-d: #FF4081; --p-on-accent-d: #000000; --p-accent-dim-d: #B02A58;
+  --p-warn-d: #FFB300; --p-danger-d: #FF5252;  --p-estimate-d: #FFC857;
+
+  --p-bg-l: #FFFFFF;  --p-surface-l: #FAF7F8;  --p-surface2-l: #F0EAEC;
+  --p-line-l: #DCD2D6; --p-line-strong-l: #8E8387;
+  --p-fg-l: #14090E;  --p-fg-dim-l: #4A3A40;   --p-fg-faint-l: #6E5C63;
+  --p-accent-l: #C2185B; --p-on-accent-l: #FFFFFF; --p-accent-dim-l: #8C1143;
+  --p-warn-l: #8A5300; --p-danger-l: #B3261E;  --p-estimate-l: #7A5200;
+}
+
+/* ==========================================================================
+   PALETTE · ARASAKA — red D32F2F
+   D32F2F on black is 3.47:1 — fine for a 48px number, not for body text. The
+   dark accent is lifted to EF5350 (6.03:1) and danger moved to orange so the
+   two never read as the same signal.
+   ========================================================================== */
+:root[data-theme="arasaka"] {
+  --p-bg-d: #000000;  --p-surface-d: #0A0A0A;  --p-surface2-d: #161010;
+  --p-line-d: #2E2020; --p-line-strong-d: #6E6060;
+  --p-fg-d: #F0E0E0;  --p-fg-dim-d: #B89898;   --p-fg-faint-d: #977B7B;
+  --p-accent-d: #EF5350; --p-on-accent-d: #000000; --p-accent-dim-d: #A33835;
+  --p-warn-d: #FFB300; --p-danger-d: #FF7043;  --p-estimate-d: #FFC857;
+
+  --p-bg-l: #FFFFFF;  --p-surface-l: #FAF8F8;  --p-surface2-l: #F0EAEA;
+  --p-line-l: #DCD4D4; --p-line-strong-l: #8E8383;
+  --p-fg-l: #120A0A;  --p-fg-dim-l: #463838;   --p-fg-faint-l: #6B5757;
+  --p-accent-l: #B71C1C; --p-on-accent-l: #FFFFFF; --p-accent-dim-l: #7F1414;
+  --p-warn-l: #8A5300; --p-danger-l: #A03408;  --p-estimate-l: #7A5200;
+}
+
+/* ==========================================================================
+   PALETTE · CHERNOBYL — green 76FF03
+   ========================================================================== */
+:root[data-theme="chernobyl"] {
+  --p-bg-d: #000000;  --p-surface-d: #0A0A0A;  --p-surface2-d: #101610;
+  --p-line-d: #202E20; --p-line-strong-d: #606E60;
+  --p-fg-d: #F1F8E9;  --p-fg-dim-d: #A0B898;   --p-fg-faint-d: #7C8C73;
+  --p-accent-d: #76FF03; --p-on-accent-d: #000000; --p-accent-dim-d: #4E9E06;
+  --p-warn-d: #FFB300; --p-danger-d: #FF5252;  --p-estimate-d: #FFC857;
+
+  --p-bg-l: #FFFFFF;  --p-surface-l: #F8FAF7;  --p-surface2-l: #EBF0E9;
+  --p-line-l: #D5DCD3; --p-line-strong-l: #838E82;
+  --p-fg-l: #0C120A;  --p-fg-dim-l: #3A4636;   --p-fg-faint-l: #5C6B56;
+  --p-accent-l: #33691E; --p-on-accent-l: #FFFFFF; --p-accent-dim-l: #234813;
+  --p-warn-l: #8A5300; --p-danger-l: #B3261E;  --p-estimate-l: #7A5200;
+}
+
+/* ==========================================================================
+   PALETTE · MONOLITH — periwinkle 9FA8DA
+   ========================================================================== */
+:root[data-theme="monolith"] {
+  --p-bg-d: #000000;  --p-surface-d: #0A0A0A;  --p-surface2-d: #101216;
+  --p-line-d: #20242E; --p-line-strong-d: #60646E;
+  --p-fg-d: #ECEFF1;  --p-fg-dim-d: #9098A8;   --p-fg-faint-d: #757D8D;
+  --p-accent-d: #9FA8DA; --p-on-accent-d: #000000; --p-accent-dim-d: #5C6499;
+  --p-warn-d: #FFB300; --p-danger-d: #FF5252;  --p-estimate-d: #FFC857;
+
+  --p-bg-l: #FFFFFF;  --p-surface-l: #F8F9FA;  --p-surface2-l: #E9EBF0;
+  --p-line-l: #D3D6DC; --p-line-strong-l: #83868E;
+  --p-fg-l: #0A0C10;  --p-fg-dim-l: #363A44;   --p-fg-faint-l: #565C6B;
+  --p-accent-l: #3949AB; --p-on-accent-l: #FFFFFF; --p-accent-dim-l: #283377;
+  --p-warn-l: #8A5300; --p-danger-l: #B3261E;  --p-estimate-l: #7A5200;
+}
+
+/* ==========================================================================
+   MAPPING · LIGHT (bare :root — nothing stamped, no dark preference)
+   ========================================================================== */
+:root {
+  --bg: var(--p-bg-l);
+  --surface: var(--p-surface-l);
+  --surface-2: var(--p-surface2-l);
+  --line: var(--p-line-l);
+  --line-strong: var(--p-line-strong-l);
+  --fg: var(--p-fg-l);
+  --fg-dim: var(--p-fg-dim-l);
+  --fg-faint: var(--p-fg-faint-l);
+  --accent: var(--p-accent-l);
+  --on-accent: var(--p-on-accent-l);
+  --accent-dim: var(--p-accent-dim-l);
+  --warn: var(--p-warn-l);
+  --danger: var(--p-danger-l);
+  --estimate: var(--p-estimate-l);
+
+  /* Calendar tints, derived rather than hand-picked per palette: mixed from
+     tokens that already pass, into the cell surface. tools/verify.py resolves
+     the mix in the browser and asserts --fg on every one at 4.5:1. Four flow
+     steps, spotting to heavy; two fertility steps, elevated and peak. */
+  --period-1: color-mix(in srgb, var(--danger) 16%, var(--surface));
+  --period-2: color-mix(in srgb, var(--danger) 28%, var(--surface));
+  --period-3: color-mix(in srgb, var(--danger) 42%, var(--surface));
+  --period-4: color-mix(in srgb, var(--danger) 58%, var(--surface));
+  --fertile-bg: color-mix(in srgb, var(--estimate) 16%, var(--surface));
+  --fertile-peak-bg: color-mix(in srgb, var(--estimate) 34%, var(--surface));
+}
+
+/* MAPPING · DARK, chosen explicitly. Wins over the system preference. */
+:root[data-mode="dark"] {
+  --bg: var(--p-bg-d);
+  --surface: var(--p-surface-d);
+  --surface-2: var(--p-surface2-d);
+  --line: var(--p-line-d);
+  --line-strong: var(--p-line-strong-d);
+  --fg: var(--p-fg-d);
+  --fg-dim: var(--p-fg-dim-d);
+  --fg-faint: var(--p-fg-faint-d);
+  --accent: var(--p-accent-d);
+  --on-accent: var(--p-on-accent-d);
+  --accent-dim: var(--p-accent-dim-d);
+  --warn: var(--p-warn-d);
+  --danger: var(--p-danger-d);
+  --estimate: var(--p-estimate-d);
+}
+
+/* MAPPING · DARK, by system preference. Guarded so an explicit light choice
+   still wins — this is the half that is usually forgotten. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-mode="light"]) {
+    --bg: var(--p-bg-d);
+    --surface: var(--p-surface-d);
+    --surface-2: var(--p-surface2-d);
+    --line: var(--p-line-d);
+    --line-strong: var(--p-line-strong-d);
+    --fg: var(--p-fg-d);
+    --fg-dim: var(--p-fg-dim-d);
+    --fg-faint: var(--p-fg-faint-d);
+    --accent: var(--p-accent-d);
+    --on-accent: var(--p-on-accent-d);
+    --accent-dim: var(--p-accent-dim-d);
+    --warn: var(--p-warn-d);
+    --danger: var(--p-danger-d);
+    --estimate: var(--p-estimate-d);
+  }
+}
+
+/* No palette stamped yet (first paint, before core applies the profile):
+   quasar is the default, so its values must already be present. */
+:root:not([data-theme]) {
+  --p-bg-d: #000000;  --p-surface-d: #0A0A0A;  --p-surface2-d: #161014;
+  --p-line-d: #2E2027; --p-line-strong-d: #6E6068;
+  --p-fg-d: #FCE4EC;  --p-fg-dim-d: #C898A8;   --p-fg-faint-d: #93777F;
+  --p-accent-d: #FF4081; --p-on-accent-d: #000000; --p-accent-dim-d: #B02A58;
+  --p-warn-d: #FFB300; --p-danger-d: #FF5252;  --p-estimate-d: #FFC857;
+
+  --p-bg-l: #FFFFFF;  --p-surface-l: #FAF7F8;  --p-surface2-l: #F0EAEC;
+  --p-line-l: #DCD2D6; --p-line-strong-l: #8E8387;
+  --p-fg-l: #14090E;  --p-fg-dim-l: #4A3A40;   --p-fg-faint-l: #6E5C63;
+  --p-accent-l: #C2185B; --p-on-accent-l: #FFFFFF; --p-accent-dim-l: #8C1143;
+  --p-warn-l: #8A5300; --p-danger-l: #B3261E;  --p-estimate-l: #7A5200;
+}

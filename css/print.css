@@ -1,0 +1,44 @@
+/* ==========================================================================
+   EPOK · PRINT
+   Owner: Window C. The doctor report, and nothing else.
+   Black on white regardless of palette. Hairlines survive; fills do not.
+   Raw black/white here is deliberate — the printed page is not themed.
+   ========================================================================== */
+
+@media print {
+  .rail, #banners, #toasts, .no-print { display: none !important; }
+
+  body, .shell, .main {
+    display: block !important;
+    background: #fff !important;
+    color: #000 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .report-page {
+    background: #fff !important;
+    color: #000 !important;
+    border: 0 !important;
+    padding: 0 !important;
+    margin: 0 !important;
+  }
+
+  .report-page h1, .report-page h2 { color: #000 !important; }
+  .report-page .dim, .report-page .faint, .report-page .small { color: #333 !important; }
+
+  .report-page table { width: 100%; border-collapse: collapse; margin-bottom: 12pt; }
+  .report-page th, .report-page td {
+    border: 1px solid #000 !important;
+    padding: 4pt 6pt;
+    text-align: left;
+    font-size: 10pt;
+    background: transparent !important;
+  }
+  .report-page th { font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; }
+
+  .report-page .rule { border-top: 1px solid #000 !important; }
+  .report-page .est { border: 1px solid #000 !important; color: #000 !important; }
+
+  @page { margin: 18mm; }
+}

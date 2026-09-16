@@ -1,0 +1,372 @@
+/* ==========================================================================
+   EPOK · BRUTAL
+   Owner: Window A. Swiss/terminal brutalist base.
+
+     · RESET       minimal, no normalize dependency
+     · TYPE        mono throughout, extreme scale contrast
+     · GEOMETRY    zero radius, zero shadow, 1px hairlines only
+     · TOKENS      declared here, valued per palette in themes.css
+     · LAYOUT      left rail desktop / bottom bar mobile, content capped AND centred
+     · COMPONENTS  card, micro-label, data number, chip, button, banner, toast, undo
+   ========================================================================== */
+
+:root {
+  --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+
+  /* Extreme scale contrast is the whole look: micro-labels against big numbers. */
+  --t-micro: 11px;    /* uppercase, 0.12em tracking */
+  --t-small: 12px;
+  --t-body: 14px;
+  --t-head: 20px;
+  --t-data: 48px;
+  --t-hero: 72px;
+
+  --radius: 0;        /* not a variable to be overridden. Brutalist means zero. */
+  --hair: 1px;
+
+  --rail-w: 220px;
+  --cap: 1120px;
+
+  --s1: 4px; --s2: 8px; --s3: 12px; --s4: 16px; --s5: 24px; --s6: 32px; --s7: 48px;
+
+  color-scheme: dark;
+}
+:root[data-mode="light"] { color-scheme: light; }
+
+/* ==========================================================================
+   RESET
+   ========================================================================== */
+
+*, *::before, *::after { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+html { -webkit-text-size-adjust: 100%; }
+
+body {
+  font-family: var(--font-mono);
+  font-size: var(--t-body);
+  line-height: 1.45;
+  background: var(--bg);
+  color: var(--fg);
+  /* Data-dense instrument, not a brochure: no font smoothing tricks, no
+     letter-spacing on body copy. */
+}
+
+img, svg { max-width: 100%; display: block; }
+/* Layout rules below set display on these elements, so [hidden] needs the
+   weight to win. Toggle with el.hidden, never with inline display. */
+[hidden] { display: none !important; }
+button, input, select, textarea { font: inherit; color: inherit; }
+h1, h2, h3, h4, p, ul, ol { margin: 0; }
+ul, ol { padding-left: var(--s5); }
+table { border-collapse: collapse; width: 100%; }
+a { color: var(--accent); }
+
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ==========================================================================
+   LAYOUT
+   --------------------------------------------------------------------------
+   A7 guard: capped AND centred. A cap alone strands background on the right
+   at 1920px — the Study Tracker bug, 564px of dead space beside every view.
+   ========================================================================== */
+
+.shell {
+  display: grid;
+  grid-template-columns: var(--rail-w) 1fr;
+  min-height: 100vh;
+}
+
+/* Hiding the rail removes it as a grid ITEM, so `main` slides into the first
+   track and renders 220px wide. Found by looking at the lock screen, which is
+   the one place the rail is hidden. The column count has to change with it. */
+body[data-locked] .shell { grid-template-columns: 1fr; }
+
+.main {
+  display: grid;
+  /* The track is declared, not inferred. With `justify-content: center` and no
+     explicit column, the track is content-sized, so a child asking for
+     `min(1120px, 100%)` resolves its 100% against a width that depends on the
+     child — and collapses to its content. The result is centred and still
+     leaves 700px of dead ground either side at 1920px, which is the same A7
+     failure wearing a different shape. Caught by looking at a screenshot; the
+     harness now asserts the content actually fills the cap. */
+  grid-template-columns: min(var(--cap), 100%);
+  justify-content: center;
+  align-content: start;
+  padding: var(--s5) var(--s4) var(--s7);
+  min-width: 0;
+}
+.main > * { min-width: 0; }
+
+.rail {
+  border-right: var(--hair) solid var(--line);
+  background: var(--surface);
+  display: flex;
+  flex-direction: column;
+  gap: var(--s5);
+  padding: var(--s5) 0;
+  position: sticky;
+  top: 0;
+  align-self: start;
+  height: 100vh;
+}
+
+.rail__brand { padding: 0 var(--s4); }
+.rail__mark {
+  display: block;
+  font-size: var(--t-head);
+  letter-spacing: 0.24em;
+  color: var(--fg);
+}
+.rail__sub {
+  display: block;
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.rail__nav { display: flex; flex-direction: column; }
+
+.rail__item {
+  appearance: none;
+  background: none;
+  border: 0;
+  border-left: 3px solid transparent;
+  text-align: left;
+  padding: var(--s3) var(--s4);
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+  cursor: pointer;
+}
+.rail__item:hover { color: var(--fg); background: var(--surface-2); }
+.rail__item.is-active {
+  color: var(--accent);
+  border-left-color: var(--accent);
+  background: var(--surface-2);
+}
+
+/* Bottom bar under 720px. The rail becomes a strip; nothing is hidden. */
+@media (max-width: 720px) {
+  .shell { grid-template-columns: 1fr; }
+  .main { padding: var(--s4) var(--s4) 88px; }
+  .rail {
+    position: fixed;
+    bottom: 0; left: 0; right: 0;
+    top: auto;
+    height: auto;
+    flex-direction: row;
+    align-items: center;
+    gap: 0;
+    padding: 0;
+    border-right: 0;
+    border-top: var(--hair) solid var(--line);
+    z-index: 40;
+  }
+  .rail__brand { display: none; }
+  .rail__nav { flex-direction: row; width: 100%; }
+  .rail__item {
+    flex: 1;
+    text-align: center;
+    border-left: 0;
+    border-top: 3px solid transparent;
+    padding: var(--s3) var(--s1);
+  }
+  .rail__item.is-active { border-left-color: transparent; border-top-color: var(--accent); }
+}
+
+/* ==========================================================================
+   TYPE PRIMITIVES
+   ========================================================================== */
+
+.micro {
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+.small { font-size: var(--t-small); color: var(--fg-dim); }
+.dim { color: var(--fg-dim); }
+.faint { color: var(--fg-faint); }
+
+.data {
+  font-size: var(--t-data);
+  line-height: 1;
+  letter-spacing: -0.02em;
+  font-variant-numeric: tabular-nums;
+}
+.hero {
+  font-size: var(--t-hero);
+  line-height: 0.95;
+  /* Tight leading suits bare digits, but a date hero carries month names:
+     the "p" in "Sep" hung 0.2em into the line below. */
+  padding-bottom: 0.2em;
+  letter-spacing: -0.03em;
+  font-variant-numeric: tabular-nums;
+}
+.unit { font-size: var(--t-micro); letter-spacing: 0.12em; color: var(--fg-faint); }
+
+/* The gold "this number is derived, not measured" tag. Every estimate in this
+   app wears it — see PLAN § the through-line. */
+.est {
+  color: var(--estimate);
+  border: var(--hair) solid var(--estimate);
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  padding: 1px var(--s1);
+  white-space: nowrap;
+}
+
+h1 { font-size: var(--t-head); letter-spacing: 0.08em; text-transform: uppercase; font-weight: 400; }
+h2 { font-size: var(--t-body); letter-spacing: 0.12em; text-transform: uppercase; font-weight: 400; color: var(--fg-dim); }
+
+/* ==========================================================================
+   COMPONENTS
+   ========================================================================== */
+
+.card {
+  border: var(--hair) solid var(--line);
+  background: var(--surface);
+  padding: var(--s4);
+  margin-bottom: var(--s4);
+}
+.card--danger { border-color: var(--danger); }
+.card__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: var(--s3);
+  border-bottom: var(--hair) solid var(--line);
+  padding-bottom: var(--s2);
+  margin-bottom: var(--s3);
+}
+
+.rule { border: 0; border-top: var(--hair) solid var(--line); margin: var(--s4) 0; }
+
+.btn {
+  appearance: none;
+  background: var(--surface-2);
+  color: var(--fg);
+  border: var(--hair) solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--s2) var(--s3);
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.btn:hover { border-color: var(--accent); color: var(--accent); }
+.btn--sm { padding: var(--s1) var(--s2); }
+.btn--accent { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+.btn--accent:hover { color: var(--on-accent); background: var(--accent-dim); border-color: var(--accent-dim); }
+.btn[disabled] { opacity: 0.4; cursor: not-allowed; }
+
+.chip {
+  appearance: none;
+  background: transparent;
+  color: var(--fg-dim);
+  border: var(--hair) solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--s2) var(--s3);
+  font-size: var(--t-micro);
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  cursor: pointer;
+}
+.chip[aria-pressed="true"] { background: var(--accent); color: var(--on-accent); border-color: var(--accent); }
+
+.row { display: flex; gap: var(--s3); flex-wrap: wrap; align-items: center; }
+
+/* ==========================================================================
+   BANNERS / TOASTS / UNDO
+   --------------------------------------------------------------------------
+   No modals. No confirm(). A banner is a state you keep seeing; a toast is
+   news; an undo is a decision you can take back.
+   ========================================================================== */
+
+#banners {
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+
+.banner {
+  border-bottom: var(--hair) solid var(--line-strong);
+  padding: var(--s2) var(--s4);
+  font-size: var(--t-small);
+  background: var(--surface-2);
+  color: var(--fg);
+}
+.banner--info   { border-bottom-color: var(--accent); }
+.banner--warn   { border-bottom-color: var(--warn);   color: var(--fg); }
+.banner--danger { border-bottom-color: var(--danger); color: var(--fg); }
+.banner--warn::before   { content: "! "; color: var(--warn); }
+.banner--danger::before { content: "!! "; color: var(--danger); }
+.banner__row { display: flex; gap: var(--s3); align-items: center; flex-wrap: wrap; }
+.banner__msg { flex: 1 1 320px; }
+
+#toasts {
+  position: fixed;
+  bottom: var(--s4);
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: var(--s2);
+  align-items: center;
+  pointer-events: none;
+  width: min(560px, calc(100% - 32px));
+}
+#toasts > * { pointer-events: auto; }
+
+.toast, .undo {
+  background: var(--surface-2);
+  border: var(--hair) solid var(--line-strong);
+  padding: var(--s2) var(--s3);
+  font-size: var(--t-small);
+  width: 100%;
+}
+.undo {
+  border-color: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--s3);
+  /* The only motion in the app. Everything else is instant by design. */
+  animation: undo-in 120ms ease-out;
+}
+.undo__label { flex: 1; min-width: 0; }
+
+@keyframes undo-in { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+@media (max-width: 720px) { #toasts { bottom: 76px; } }
+@media (prefers-reduced-motion: reduce) { .undo { animation: none; } }
+
+/* ==========================================================================
+   LOCK SCREEN
+   ========================================================================== */
+
+.lock { max-width: 460px; margin: 10vh auto 0; }
+
+.pin {
+  display: block;
+  width: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  border: var(--hair) solid var(--line-strong);
+  border-radius: var(--radius);
+  padding: var(--s3);
+  margin-bottom: var(--s3);
+  font-size: var(--t-head);
+  letter-spacing: 0.5em;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+.pin:focus { border-color: var(--accent); }
