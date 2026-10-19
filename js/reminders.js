@@ -125,10 +125,10 @@
     if (!M || typeof M.predict !== "function") return null;
     var s = E.Store.get();
     try {
-      var p = M.predict(E.Store.cycles(), {
-        conditions: s.profile.conditions, ageBand: s.profile.ageBand, days: s.days
-      });
-      return (p && p.nextStart && !p.refused) ? p : null;
+      var o = E.Store.modelOpts(); o.noMae = true;
+      var p = M.predict(E.Store.cycles(), o);
+      // An expired forecast is not something to remind anyone about.
+      return (p && p.nextStart && !p.refused && !p.expired) ? p : null;
     } catch (e) { return null; }
   }
 

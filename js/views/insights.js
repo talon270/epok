@@ -75,6 +75,74 @@
      STATS
      ================================================================== */
 
+  // Below this many settled saved forecasts the error shown is the backtest's
+  // reconstruction, and the card says so. UNSOURCED threshold: six is roughly
+  // the number of cycles the model's own prior takes to fade.
+  var SAVED_MIN = 6;
+  function settled(s) {
+    return (s.predictions || []).filter(function (p) { return p.actual != null && !p.void; });
+  }
+  function savedSettled(s) { return settled(s).length; }
+
+  /* ==================================================================
+     FORECAST HISTORY — forecasts epok actually showed, settled against
+     what happened. Distinct from the backtest above, which rebuilds them.
+     ================================================================== */
+
+  function forecastHistorySection() {
+    var s = E.Store.get();
+    var preds = (s.predictions || []).filter(function (p) { return !p.void; });
+    if (!preds.length) {
+      return group("FORECAST HISTORY", [E.el("p", { class: "small dim", text:
+        "No forecast has been saved yet. Once a cycle has one, each version is kept here with the date it was made, " +
+        "and settled against the real start when it arrives." })]);
+    }
+    var done = settled(s);
+    var summary;
+    if (done.length >= SAVED_MIN) {
+      var errs = done.map(function (p) { return Math.abs(p.errorDays); }).sort(function (a, b) { return a - b; });
+      var med = errs.length % 2 ? errs[errs.length >> 1] : (errs[(errs.length >> 1) - 1] + errs[errs.length >> 1]) / 2;
+      var hit = done.filter(function (p) { return p.inWindow; }).length;
+      summary = "Measured on " + done.length + " forecasts epok actually showed: median error " + med + " day" +
+        (med === 1 ? "" : "s") + ", " + hit + " of " + done.length + " starts inside the printed window.";
+    } else {
+      summary = "Only " + done.length + " saved forecast" + (done.length === 1 ? " has" : "s have") + " been settled so far. Until there are " +
+        SAVED_MIN + ", the MEASURED ERROR above is reconstructed from your history, not from forecasts you were shown.";
+    }
+
+    var head = E.el("tr", {}, ["MADE", "FOR", "ACTUAL", "LEAD", "ERROR", "WINDOW", "WHY IT CHANGED"].map(function (h) {
+      return E.el("th", { text: h });
+    }));
+    var rows = preds.slice().reverse().slice(0, 24).map(function (p) {
+      var sameAnchor = preds.filter(function (q) { return q.anchor === p.anchor && q.madeOn <= p.madeOn && q !== p; });
+      var prev = sameAnchor[sameAnchor.length - 1];
+      var why = "first forecast for this cycle";
+      if (prev) {
+        var bits = [];
+        var shift = E.daysBetween(prev.nextStart, p.nextStart);
+        if (shift) bits.push("moved " + (shift > 0 ? "+" : "") + shift + " d");
+        if (prev.mode !== p.mode) bits.push(prev.mode + " → " + p.mode);
+        if (prev.n !== p.n) bits.push("fit on " + p.n + " cycles, was " + prev.n);
+        if (prev.modelVersion !== p.modelVersion) bits.push("engine v" + prev.modelVersion + " → v" + p.modelVersion);
+        why = bits.join("; ") || "window changed";
+      }
+      var err = p.actual == null ? "—" : (p.errorDays > 0 ? "+" : "") + p.errorDays + " d";
+      return E.el("tr", {}, [
+        E.el("td", { text: E.prettyDate(p.madeOn) }), E.el("td", { text: E.prettyDate(p.nextStart) }),
+        E.el("td", { text: p.actual ? E.prettyDate(p.actual) : "PENDING" }),
+        E.el("td", { text: p.actual ? E.daysBetween(p.madeOn, p.actual) + " d" : "—" }),
+        E.el("td", { text: err }),
+        E.el("td", { text: p.actual == null ? "—" : p.inWindow ? "HIT" : "MISS" }),
+        E.el("td", { text: why })
+      ]);
+    });
+    return group("FORECAST HISTORY", [
+      E.el("p", { class: "small", text: summary }),
+      E.el("p", { class: "small faint", text: "ERROR is forecast minus actual: positive means the forecast was late. LEAD is how many days before the real start the forecast was made." }),
+      E.el("div", { style: "overflow-x:auto" }, [E.el("table", { class: "report-table" }, [head].concat(rows))])
+    ]);
+  }
+
   function statsSection(cycles, days) {
     var closed = cycles.filter(function (c) { return c.length != null; });
     var lengths = closed.map(function (c) { return c.length; });
@@ -86,7 +154,7 @@
     var s = E.Store.get();
     var mae = null, scored = 0;
     if (M && cycles.length) {
-      var opts = { conditions: s.profile.conditions, ageBand: s.profile.ageBand, days: s.days };
+      var opts = E.Store.modelOpts();
       mae = M.predict(cycles, opts).mae;
       if (mae != null && E.Backtest) scored = E.Backtest.run(cycles, opts).n;
     }
@@ -100,7 +168,8 @@
                  "FROM " + count(lengths.length, "COMPLETE CYCLE")),
         statTile("AVG PERIOD LENGTH", periodLengths.length ? Math.round(mean(periodLengths) * 10) / 10 : null, "DAYS",
                  "FROM " + count(periodLengths.length, "PERIOD")),
-        statTile("MEASURED ERROR", mae, "DAYS", "MEDIAN OVER " + count(scored, "PAST PREDICTION"))
+        statTile("MEASURED ERROR", mae, "DAYS", "MEDIAN OVER " + count(scored, "PAST PREDICTION") +
+                 (savedSettled(s) >= SAVED_MIN ? "" : " · RECONSTRUCTED FROM YOUR LOG"))
       ])
     ]);
   }
@@ -231,6 +300,7 @@
 
     var M = window.Epok.Model;
     var ov = M ? M.detectOvulation(days, cur.start, end) : null;
+    if (ov && !ov.date) ov = null;        // LH and temperature disagree: no single day to mark
 
     var children = [svgEl("path", { d: pathD, fill: "none", stroke: "var(--accent)", "stroke-width": "2" })];
     if (ov) {
@@ -276,25 +346,42 @@
       var span = E.daysBetween(x.c.start, x.end);
       for (var k = 0; k <= span; k++) periodDayKeys[E.shiftDay(x.c.start, k)] = i;
     });
-    var periodTotal = Object.keys(periodDayKeys).length;
+    var periodKeys = Object.keys(periodDayKeys);
+    var nonPeriodKeys = Object.keys(days).filter(function (k) { return !(k in periodDayKeys); });
 
-    var allLoggedKeys = Object.keys(days).filter(function (k) { return days[k].tags && days[k].tags.length; });
-    var nonPeriodKeys = allLoggedKeys.filter(function (k) { return !(k in periodDayKeys); });
-
-    var tagIds = window.Epok.Tags.visible().map(function (t) { return t.id; });
+    // A day only counts as "no <tag>" if the user was actually looking at that
+    // kind of symptom: a tag in the same category on that day, or an explicit
+    // check-in. A BBT-only day, or a day with only a mood tag, says nothing
+    // about cramps — counting it as a cramp-free day made the same cramps
+    // appear or vanish depending on which unrelated tags had been logged.
+    // Both groups use the same rule; the period group used to count every
+    // period day while the other group counted only tagged ones.
+    var tags = window.Epok.Tags.visible();
+    var catOf = {};
+    window.Epok.Tags.ALL.concat(tags).forEach(function (t) { catOf[t.id] = t.category; });
+    function observed(d, cat) {
+      if (!d) return false;
+      if (d.checkin) return true;
+      return (d.tags || []).some(function (id) { return catOf[id] === cat; });
+    }
     var rows = [];
 
-    tagIds.forEach(function (id) {
-      var periodHits = 0, cyclesWithTag = {};
-      Object.keys(periodDayKeys).forEach(function (k) {
-        if (days[k] && days[k].tags && days[k].tags.indexOf(id) >= 0) { periodHits++; cyclesWithTag[periodDayKeys[k]] = true; }
+    tags.forEach(function (t) {
+      var id = t.id, periodHits = 0, periodTotal = 0, cyclesWithTag = {};
+      periodKeys.forEach(function (k) {
+        if (!observed(days[k], t.category)) return;
+        periodTotal++;
+        if (days[k].tags.indexOf(id) >= 0) { periodHits++; cyclesWithTag[periodDayKeys[k]] = true; }
       });
       var nCyclesWithTag = Object.keys(cyclesWithTag).length;
       if (nCyclesWithTag < CORR_MIN_CYCLES) return;
 
-      var nonHits = 0;
-      nonPeriodKeys.forEach(function (k) { if (days[k].tags.indexOf(id) >= 0) nonHits++; });
-      var nonTotal = nonPeriodKeys.length;
+      var nonHits = 0, nonTotal = 0;
+      nonPeriodKeys.forEach(function (k) {
+        if (!observed(days[k], t.category)) return;
+        nonTotal++;
+        if (days[k].tags.indexOf(id) >= 0) nonHits++;
+      });
       if (periodTotal < 1 || nonTotal < 1) return;
 
       var p1 = periodHits / periodTotal, p2 = nonHits / nonTotal;
@@ -304,9 +391,17 @@
       var z = (p1 - p2) / se;
       if (z < CORR_Z_CRITICAL) return;
 
-      var label = (window.Epok.Tags.ALL.filter(function (t) { return t.id === id; })[0] || { label: id }).label;
-      rows.push({ z: z, text: label + " on " + periodHits + " of your last " + periodTotal +
-        " period days (" + withEnd.length + " cycle" + (withEnd.length === 1 ? "" : "s") + ")." });
+      var rated = [];
+      periodKeys.forEach(function (k) {
+        var r = days[k] && days[k].severity && days[k].severity[id];
+        if (r) rated.push(r);
+      });
+      var sevText = rated.length
+        ? " Your own rating averaged " + (rated.reduce(function (a, b) { return a + b; }, 0) / rated.length).toFixed(1) +
+          " of 3 over " + rated.length + " rated day" + (rated.length === 1 ? "" : "s") + "."
+        : "";
+      rows.push({ z: z, text: t.label + " on " + periodHits + " of the " + periodTotal +
+        " period days you checked for it (" + withEnd.length + " cycle" + (withEnd.length === 1 ? "" : "s") + ")." + sevText });
     });
 
     if (!rows.length) {
@@ -342,6 +437,7 @@
     return E.el("div", {}, [
       E.el("h1", { text: "INSIGHTS", style: "margin-bottom:var(--s4)" }),
       statsSection(cycles, days),
+      forecastHistorySection(),
       trendSection(cycles),
       bbtSection(cycles, days),
       heatmapSection(cycles, days),

@@ -67,11 +67,11 @@ else (window.Epok = window.Epok || {}).Model = Model;
 
 One key: `epok.state.v1`. Write-through previous state at `epok.state.prev`.
 
-`SCHEMA_VERSION = 1`. Bumping it ships its migration in the same change.
+`SCHEMA_VERSION = 4` (v2: `profile.reminders`; v3: `cycle.source`, `meta.rejectedStarts`, `day.checkin`; v4: `events`, `cycle.excluded`, `day.severity`, `day.impact`, `day.bbtMeta`). Bumping it ships its migration in the same change.
 
 ```js
 {
-  v: 1,
+  v: 4,
   profile: {
     created:        "2026-09-16",   // ymd, set once
     ageBand:        null,           // null|"u20"|"20s"|"30s"|"40s"|"50plus"
@@ -97,7 +97,12 @@ One key: `epok.state.v1`. Write-through previous state at `epok.state.prev`.
       bbt:   null,      // number, °C, 2dp. Storage is always metric.
       lh:    null,      // null|"negative"|"positive"
       pill:  null,      // null|"taken"|"missed"|"placebo"
-      note:  ""
+      note:  "",
+      severity: {},     // v4. { tagId: 1..3 } the user's own rating; only for tags that are on
+      impact: null,     // v4. null|"none"|"some"|"a-lot"
+      bbtMeta: null,    // v4. { time: "HH:MM"|null, disturbed: null|"illness"|"alcohol"|"poor-sleep"|"travel"|"early-alarm"|"other" }
+                        //     a disturbed reading stays in the log and is ignored by detectOvulation()
+      checkin: false    // v3. true = "I looked, nothing to log" — an empty tag list then means NONE, not unknown
     }
   },
 
@@ -109,7 +114,10 @@ One key: `epok.state.v1`. Write-through previous state at `epok.state.prev`.
       end:    "2026-08-23",   // ymd|null, last bleeding day
       length: 29,             // int|null — days to next start; null while current
       ovulation: null,        // ymd|null
-      ovulationSource: null   // null|"bbt"|"lh"|"both"
+      ovulationSource: null,  // null|"bbt"|"lh"|"both"
+      excluded: false,        // v4. true = shown everywhere, never fitted
+      source: "manual"        // v3. "manual" = marked/moved by the user; "flow" = inferred from the flow log.
+                              // Only "flow" starts are ever moved or removed by the app.
     }
   ],
 
@@ -117,14 +125,26 @@ One key: `epok.state.v1`. Write-through previous state at `epok.state.prev`.
     { id: "custom-1", label: "PHYSIO", category: "pain" }
   ],
 
-  predictions: [
-    // Appended each time a prediction is made. This is how the app measures
-    // its own error: compared against what the next cycle actually did.
-    { madeOn: "2026-09-14", nextStart: "2026-10-02", window: ["2026-09-30", "2026-10-04"],
-      mode: "cycle-length", n: 9, actual: null, errorDays: null }
+  events: [
+    // v4. Dated spans. `to: null` = ongoing; `from: null` = unknown start (covers everything before `to`).
+    // pregnancy | postpartum -> cycles overlapping them leave the fit; an open one pauses predict()/fertility()
+    // contraception (closed, ovulation-suppressing method) -> overlapping cycles leave the fit
+    // contraception (open) = the CURRENT method, kept in step with profile.contraception; read from opts.contraception
+    // breastfeeding | medication | other -> recorded and shown; breastfeeding adds a caveat to the forecast
+    { id: "ev-…", type: "pregnancy", method: null, from: "2026-05-01", to: null, note: "" }
   ],
 
-  meta: { lastOpened: "2026-09-16", onboarded: false }
+  predictions: [
+    // Written by storage.writeNow() when a cycle first has a forecast and whenever it changes
+    // (one per cycle per day). Settled when the next start is logged. `void` = its anchor start was moved/removed. This is how the app measures
+    // its own error: compared against what the next cycle actually did.
+    { madeOn: "2026-09-14", anchor: "2026-08-18", nextStart: "2026-10-02", window: ["2026-09-30", "2026-10-04"],
+      mode: "cycle-length", n: 9, modelVersion: 2, inputRev: "9:2026-08-18:9",
+      actual: null, errorDays: null, inWindow: null }   // errorDays = forecast minus actual
+  ],
+
+  meta: { lastOpened: "2026-09-16", onboarded: false,
+          rejectedStarts: [] }   // v3. ymd starts the user removed that the flow log would re-infer
 }
 ```
 
@@ -197,6 +217,25 @@ Epok.Store.clearPeriodStart(key)    -> void
 
 Epok.Store.setProfile(patch)    -> void
 
+// The one place the model's inputs are built: { conditions, ageBand, days,
+// asOf: today, contraception: { id, label, start } | null }. Views pass this
+// to Model.predict / fertility / history and Backtest.run; do not rebuild it.
+Epok.Store.modelOpts()          -> opts
+// Spotting alone never starts a cycle. Reconciles inferred ("flow") starts both
+// ways — moves one when a backfilled day begins the streak earlier, removes one
+// when its flow is cleared — and never touches a "manual" start.
+Epok.Store.deriveCyclesFromFlow() -> [ymd]   // starts created
+
+// v4
+Epok.Store.addEvent({ type, method?, from?, to?, note? }) -> { ok, error, id }
+Epok.Store.endEvent(id, to)     -> { ok, error }
+Epok.Store.removeEvent(id)      -> { ok, error }
+Epok.Store.setCycleExcluded(start, bool) -> { ok, error }
+Epok.Store.moveStart(from, to)  -> { ok, error }   // any date; refuses one within the merge window of ANOTHER start
+// Changing profile.contraception closes the open method event (or records the old method as a closed one).
+Epok.Store._applyRemote([{ k, v|null }])   // sync only; goes through the normalisers and save()
+Epok.Store._onSaved                         // set by Epok.Sync while sync is on
+
 // Ids are stable forever ("custom-<slug>"); labels are stored uppercase.
 // Refuses empty, over MAX_TAG_LABEL (24), unknown category, or a label that
 // already exists in that category (built-in or custom). Registers an undo.
@@ -230,8 +269,17 @@ under Node.
 
 ```js
 Epok.Model.predict(cycles, opts) -> Prediction
-// cycles: [cycle] as stored, ascending. opts: { conditions:[], ageBand, days }
-//   `days` is the days map — needed only for BBT/LH in luteal mode.
+// cycles: [cycle] as stored, ascending.
+// opts: { conditions:[], ageBand, days, asOf, contraception, events }
+//   `days`  the days map — needed only for BBT/LH in luteal mode. Past cycles'
+//           ovulation is DERIVED from it when cycle.ovulation is empty.
+//   `asOf`  the date the forecast is made on. Nothing logged after it is read.
+//           Omitted: the newest logged day stands in.
+//   `contraception` { id, label, start } — an ovulation-suppressing method
+//           (combined pill, patch, ring, injection, implant, continuous) pauses
+//           the forecast from `start` (no start = paused outright).
+//   `events` state.events. Pregnancy/postpartum/closed-method spans drop overlapping cycles
+//           from the fit; an open pregnancy or postpartum span pauses (paused: "event").
 
 Prediction = {
   mode:      "population" | "cycle-length" | "luteal",
@@ -243,13 +291,18 @@ Prediction = {
   prior:     { mean: 29.3, sd: 5.0, source: "population"|"pcos"|"perimenopause"|... },
   regime:    { changed: bool, since: ymd | null, dropped: int },
   mae:       number | null,       // measured median abs error, from backtest
+  asOf:      ymd | null,
+  expired:   bool,                // asOf is past the window's end and no start is logged
+  paused:    "contraception" | "event" | null,   // refused for a method or open span, not for lack of cycles
   reason:    string               // one plain sentence the card renders verbatim
 }
 
 Epok.Model.fertility(cycles, opts) -> {
   bands:     [{ date: ymd, band: "low"|"elevated"|"peak", p: 0.0-1.0 }],
   ovulation: { date: ymd, source: "bbt"|"lh"|"both"|"estimated" } | null,
-  confirmed: bool,
+  confirmed: bool,                // true only for LH+BBT agreeing or a recorded date; one signal is "detected"
+  conflict:  { lh: ymd, bbt: ymd } | null,   // signals disagree: neither used
+  paused:    "contraception"?,    // present (bands: []) while a suppressing method is in use
   reason:    string
 }
 // Never returns a "window closed" claim. See PLAN A6.
@@ -259,13 +312,20 @@ Epok.Model.fertility(cycles, opts) -> {
 Epok.Model.history(cycles, opts) -> [{
   start: ymd, end: ymd,           // end is the day before the next start
   ovulation: { date: ymd, source: "bbt"|"lh"|"both"|"recorded"|"estimated" },
-  confirmed: bool,                // true when BBT/LH over that cycle fired
+  confirmed: bool,                // LH+BBT agreed (or recorded); a single signal is detected, not confirmed
+  conflict: { lh: ymd, bbt: ymd } | null,
   bands: [{ date: ymd, band: "low"|"elevated"|"peak", p: 0.0-1.0 }]   // inside [start, end]
 }]
 
 Epok.Model.detectOvulation(days, cycleStart, cycleEnd) -> {
-  date: ymd, source: "bbt"|"lh"|"both", rule: "3-over-6"|"lh-positive"
+  date: ymd | null,               // null when source === "conflict"
+  source: "bbt"|"lh"|"both"|"conflict",
+  rule: "3-over-6"|"lh-positive"|"disagree",
+  lh: ymd | null, bbt: ymd | null // each signal's own date, kept apart
 } | null
+// "both" needs the two dates within 3 days; further apart is a conflict.
+
+Epok.Model.withOvulation(cycles, days) -> cycles   // closed cycles with a derived ovulation filled in
 
 Epok.Model.lutealStats(cycles) -> { mean, sd, n } | null
 ```
@@ -276,7 +336,7 @@ Epok.Model.lutealStats(cycles) -> { mean, sd, n } | null
 Epok.Backtest.run(cycles) -> {
   mae:     number,        // median absolute error, days
   n:       int,           // predictions scored
-  perCycle: [{ start: ymd, predicted: ymd, actual: ymd, errorDays: int }]
+  perCycle: [{ start: ymd, predicted: ymd, actual: ymd, errorDays: int, window: [ymd, ymd] }]
 }
 ```
 
@@ -370,3 +430,25 @@ in the space beside the rail:
 Checked at 1920px, 1440px and 400px. No stranded background on the right, ever.
 Where a view has room to spare it gets a real right-rail module — never just a
 wider cap.
+
+## `Epok.Sync` — opt-in sync (js/sync.js)
+
+Off unless configured. Config lives in its own key `epok.sync.v1` (url, token, salt,
+change bookkeeping) — never in state, never in an export. The passphrase is never stored.
+
+```js
+Epok.Sync.available()            -> bool            // needs WebCrypto
+Epok.Sync.setup({ url, token, passphrase }) -> Promise<{ pulled, pushed, conflicts, raced }>
+Epok.Sync.unlock(passphrase)     -> Promise<summary> // once per session; verified against a stored check
+Epok.Sync.syncNow()              -> Promise<summary> // rejects with { kind: network|auth|reset|mass-delete|locked|off|… }
+Epok.Sync.setEnabled(bool)       -> void             // edits are still tracked while paused
+Epok.Sync.deleteRemote()         -> Promise<rows>    // removes the uploaded copy, forgets config here
+Epok.Sync.forget()               -> void             // this device only
+Epok.Sync.status()               -> { configured, enabled, unlocked, url, lastSync, lastError, conflicts, pending, syncing }
+```
+
+Wire: `POST {url}/v2/pipeline`, `Authorization: Bearer <token>`, Hrana-over-HTTP `execute` requests.
+Table `epok_records(id, kind, hash, payload, updated_at, deleted)` and `epok_meta(k, v)`.
+Records: one per logged day (`day:YYYY-MM-DD`) and one per list (`blob:cycles|events|profile|customTags|predictions|rejected`).
+`id` and `hash` are HMAC-SHA-256 under a key derived from the passphrase; `payload` is AES-GCM of `{ k, v }`.
+**Unverified against a real Turso endpoint** — see README § Optional sync.

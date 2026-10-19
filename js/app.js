@@ -20,6 +20,7 @@
   var VIEW_ORDER = [
     { key: "Today",    id: "today",    title: "TODAY" },
     { key: "Calendar", id: "calendar", title: "CALENDAR" },
+    { key: "Timeline", id: "timeline", title: "TIMELINE" },
     { key: "Insights", id: "insights", title: "INSIGHTS" },
     { key: "Settings", id: "settings", title: "SETTINGS" },
     { key: "Report",   id: "report",   title: "REPORT" }
@@ -118,6 +119,7 @@
 
     registerServiceWorker();
     E.Reminders.schedule();
+    if (E.Sync) E.Sync.init();
 
     // The save is debounced; a closing tab does not wait for it.
     window.addEventListener("pagehide", function () { E.Store.flush(); });

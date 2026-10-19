@@ -22,7 +22,7 @@
   // Every date key in the app derives from this one setting. Bleed at 23:00,
   // log it at 00:20, and it still lands on the right day.
   var DAY_BOUNDARY_DEFAULT = 4;   // hours past midnight, settable 0-6
-  var SCHEMA_VERSION = 2;   // v2 added profile.reminders — see storage.js MIGRATIONS
+  var SCHEMA_VERSION = 4;   // v2 reminders, v3 start provenance + check-in, v4 events + severity + BBT notes + cycle.excluded — see storage.js MIGRATIONS
 
   var THEMES = ["quasar", "arasaka", "chernobyl", "monolith"];
   var MODES  = ["dark", "light", "system"];

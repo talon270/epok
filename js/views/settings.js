@@ -598,6 +598,179 @@
     return group("ADD A PAST PERIOD", body);
   }
 
+  /* ==================================================================
+     EVENTS — dated spans the model reads. See storage.js § EVENTS.
+     ================================================================== */
+
+  var EVENT_LABELS = { pregnancy: "PREGNANCY", postpartum: "POSTPARTUM", breastfeeding: "BREASTFEEDING",
+                       contraception: "A METHOD (PAST)", medication: "MEDICATION", other: "OTHER" };
+  var evDraft = { type: "pregnancy", method: "", from: "", to: "", note: "", error: "" };
+
+  function eventsSection() {
+    var s = E.Store.get();
+    var C = window.Epok.Contraception;
+    var list = s.events.slice().sort(function (a, b) { return (b.from || "") < (a.from || "") ? -1 : 1; });
+
+    var rows = list.length ? list.map(function (e) {
+      var what = EVENT_LABELS[e.type] + (e.type === "contraception" && C && C.BY_ID[e.method] ? " — " + C.BY_ID[e.method].label : "");
+      var span = (e.from ? E.prettyDate(e.from) : "unknown start") + " → " + (e.to ? E.prettyDate(e.to) : "ongoing");
+      var cur = e.type === "contraception" && e.to == null;
+      return E.el("div", { class: "reminder-row", "data-event": e.id }, [
+        E.el("span", { class: "small", text: what + " · " + span + (e.note ? " · " + e.note : "") }),
+        cur ? E.el("span", { class: "micro faint", text: "CURRENT METHOD — CHANGE IT ABOVE" })
+            : E.el("div", { class: "row" }, [
+                e.to == null ? chip("END TODAY", false, function () { E.Store.endEvent(e.id, E.today()); }) : null,
+                chip("REMOVE", false, function () { E.Store.removeEvent(e.id); })
+              ])
+      ]);
+    }) : [E.el("p", { class: "small dim", text: "No events yet." })];
+
+    function field(label, el) { return E.el("div", { class: "field" }, [E.el("span", { class: "micro field__label", text: label }), el]); }
+    var typeRow = E.el("div", { class: "row" }, ["pregnancy", "postpartum", "breastfeeding", "contraception", "medication", "other"].map(function (t) {
+      return chip(EVENT_LABELS[t], evDraft.type === t, function () { evDraft.type = t; E.refresh(); });
+    }));
+    var methodRow = evDraft.type !== "contraception" ? null : field("WHICH METHOD", E.el("div", { class: "row" },
+      (C ? C.METHODS.filter(function (m) { return m.id !== "none"; }) : []).map(function (m) {
+        return chip(m.label, evDraft.method === m.id, function () { evDraft.method = m.id; E.refresh(); });
+      })));
+    var from = E.el("input", { type: "date", class: "text-input", value: evDraft.from, "aria-label": "Event start",
+      onchange: function (e) { evDraft.from = e.target.value; } });
+    var to = E.el("input", { type: "date", class: "text-input", value: evDraft.to, "aria-label": "Event end",
+      onchange: function (e) { evDraft.to = e.target.value; } });
+    var note = E.el("input", { type: "text", class: "text-input", value: evDraft.note, maxlength: "120",
+      placeholder: "Note (optional)", "aria-label": "Event note", onchange: function (e) { evDraft.note = e.target.value; } });
+
+    return group("EVENTS", [
+      E.el("p", { class: "small faint", text:
+        "Dated spans that change what a cycle means. Pregnancy, postpartum and a past hormonal method keep the cycles they overlap out of the " +
+        "prediction; an open pregnancy or postpartum span pauses it. Breastfeeding and medication are recorded and shown, and change nothing " +
+        "except a caveat on the forecast. epok gives no advice about any of them." }),
+      E.el("div", {}, rows),
+      E.el("hr", { class: "rule" }),
+      field("ADD AN EVENT", typeRow), methodRow,
+      field("FROM (BLANK = UNKNOWN START)", from), field("TO (BLANK = ONGOING)", to), field("NOTE", note),
+      evDraft.error ? E.el("p", { class: "small", role: "status", text: evDraft.error }) : null,
+      E.el("div", { class: "row" }, [chip("ADD EVENT", false, function () {
+        var r = E.Store.addEvent({ type: evDraft.type, method: evDraft.method, from: evDraft.from, to: evDraft.to, note: evDraft.note });
+        evDraft.error = r.ok ? "" : r.error;
+        if (r.ok) evDraft = { type: "pregnancy", method: "", from: "", to: "", note: "", error: "" };
+        E.refresh();
+      })])
+    ]);
+  }
+
+  /* ==================================================================
+     SYNC — opt-in, off by default. See js/sync.js for what it does and what
+     the database can see. Nothing is uploaded until the form is completed.
+     ================================================================== */
+
+  var syncDraft = { url: "", token: "", pass: "", pass2: "", ack: false, error: "", busy: false };
+  var syncUi = { unlockPass: "", message: "", error: "", busy: false, confirmDelete: false };
+
+  function syncSection() {
+    var Y = window.Epok.Sync;
+    if (!Y || !Y.available()) {
+      return group("SYNC", [E.el("p", { class: "small dim", text: "Sync needs WebCrypto, which this browser does not offer here, so it stays off. Your log is unaffected." })]);
+    }
+    var st = Y.status();
+    function field(label, el) { return E.el("div", { class: "field" }, [E.el("span", { class: "micro field__label", text: label }), el]); }
+    function input(type, key, store, label, extra) {
+      var o = { type: type, class: "text-input", value: store[key], "aria-label": label, autocomplete: "off", spellcheck: "false",
+        onchange: function (e) { store[key] = e.target.value; } };
+      if (extra) Object.keys(extra).forEach(function (k) { o[k] = extra[k]; });
+      return E.el("input", o);
+    }
+    function ago(ms) { return ms ? new Date(ms).toLocaleString() : "never"; }
+
+    if (!st.configured) {
+      return group("SYNC (OPTIONAL — OFF)", [
+        // The outcome of the last action (delete, forget) lands here, because
+        // those actions leave sync unconfigured and this is the branch that renders.
+        syncUi.message ? E.el("p", { class: "small", role: "status", text: syncUi.message }) : null,
+        syncUi.error ? E.el("p", { class: "small", role: "status", text: syncUi.error }) : null,
+        E.el("p", { class: "small", text: "Keeps an encrypted copy of your log in a Turso database that you own, so another device can read it. Nothing is uploaded until you finish this form." }),
+        E.el("p", { class: "small faint", text: "Uploaded: every logged day, cycle, event, forecast and tag, as AES-GCM ciphertext made in this browser from your passphrase." }),
+        E.el("p", { class: "small faint", text: "The database can see: how many rows exist, when each was last written, and ciphertext. It cannot see dates, flow, symptoms, temperatures or notes." }),
+        E.el("p", { class: "small faint", text: "Lose the passphrase and the uploaded copy cannot be opened by anyone, including you. Your log on this device is not affected." }),
+        E.el("p", { class: "small faint", text: "The token is kept in this browser only. It is not covered by the PIN and is not in backups. It can read and write only ciphertext in that one database." }),
+        E.el("p", { class: "small faint", text: "Works offline. When the database cannot be reached epok says so, with the time of the last good sync, and your log carries on locally." }),
+        field("DATABASE URL (libsql://… OR https://…)", input("text", "url", syncDraft, "Database URL", { placeholder: "libsql://your-db-your-org.turso.io" })),
+        field("DATABASE TOKEN", input("password", "token", syncDraft, "Database token")),
+        field("SYNC PASSPHRASE (8+ CHARACTERS)", input("password", "pass", syncDraft, "Sync passphrase")),
+        field("REPEAT THE PASSPHRASE", input("password", "pass2", syncDraft, "Repeat the sync passphrase")),
+        E.el("div", { class: "row" }, [chip("I UNDERSTAND A LOST PASSPHRASE CANNOT BE RECOVERED", syncDraft.ack, function () { syncDraft.ack = !syncDraft.ack; E.refresh(); })]),
+        syncDraft.error ? E.el("p", { class: "small", role: "status", text: syncDraft.error }) : null,
+        syncDraft.busy ? E.el("p", { class: "small dim", role: "status", text: "Connecting, then uploading… this can take a few seconds." }) : null,
+        E.el("div", { class: "row" }, [chip("TURN ON SYNC", false, function () {
+          if (syncDraft.busy) return;
+          if (!syncDraft.ack) { syncDraft.error = "Tick the box to confirm you understand the passphrase cannot be recovered."; E.refresh(); return; }
+          if (syncDraft.pass !== syncDraft.pass2) { syncDraft.error = "The two passphrases differ."; E.refresh(); return; }
+          syncDraft.busy = true; syncDraft.error = ""; E.refresh();
+          Y.setup({ url: syncDraft.url, token: syncDraft.token, passphrase: syncDraft.pass }).then(function (sum) {
+            syncDraft = { url: "", token: "", pass: "", pass2: "", ack: false, error: "", busy: false };
+            syncUi.message = "Sync is on. Uploaded " + sum.pushed + " record" + (sum.pushed === 1 ? "" : "s") + ", received " + sum.pulled + ".";
+            E.refresh();
+          }, function (err) { syncDraft.busy = false; syncDraft.error = err.message; E.refresh(); });
+        })])
+      ]);
+    }
+
+    var lines = [
+      E.el("p", { class: "small", text: (st.enabled ? "Sync is ON" : "Sync is PAUSED") + " · " + st.url }),
+      E.el("p", { class: "small dim", text: "Last good sync: " + ago(st.lastSync) + " · " + st.pending + " local change" + (st.pending === 1 ? "" : "s") + " not yet uploaded." })
+    ];
+    if (st.lastError) lines.push(E.el("p", { class: "small", role: "status", text: "Not current: " + st.lastError.message }));
+    if (syncUi.message) lines.push(E.el("p", { class: "small", role: "status", text: syncUi.message }));
+    if (syncUi.error) lines.push(E.el("p", { class: "small", role: "status", text: syncUi.error }));
+
+    var actions = [];
+    if (!st.unlocked) {
+      lines.push(field("SYNC PASSPHRASE — NEEDED ONCE PER SESSION", input("password", "unlockPass", syncUi, "Sync passphrase")));
+      actions.push(chip("UNLOCK SYNC", false, function () {
+        syncUi.error = ""; syncUi.message = "";
+        Y.unlock(syncUi.unlockPass).then(function (sum) {
+          syncUi.unlockPass = ""; syncUi.message = "Synced. Uploaded " + sum.pushed + ", received " + sum.pulled + "."; E.refresh();
+        }, function (err) { syncUi.error = err.message; E.refresh(); });
+      }));
+    } else {
+      actions.push(chip("SYNC NOW", false, function () {
+        syncUi.error = ""; syncUi.message = "Syncing…"; E.refresh();
+        Y.syncNow().then(function (sum) {
+          syncUi.message = "Synced. Uploaded " + sum.pushed + ", received " + sum.pulled + (sum.conflicts ? ", " + sum.conflicts + " conflict" + (sum.conflicts === 1 ? "" : "s") + " (below)" : "") + ".";
+          E.refresh();
+        }, function (err) { syncUi.message = ""; syncUi.error = err.message; E.refresh(); });
+      }));
+    }
+    actions.push(chip(st.enabled ? "PAUSE SYNC" : "RESUME SYNC", false, function () { Y.setEnabled(!st.enabled); E.refresh(); }));
+    actions.push(chip("FORGET SYNC ON THIS DEVICE", false, function () { Y.forget(); syncUi.message = "Sync is off on this device. The database was left as it was."; E.refresh(); }));
+
+    var conflicts = (st.conflicts || []).length ? [
+      E.el("p", { class: "micro", text: "CONFLICTS — THE SAME RECORD CHANGED ON TWO DEVICES" }),
+      E.el("p", { class: "small faint", text: "The newer edit was kept. The other version is listed here; nothing was overwritten without epok.state.prev holding the previous local state." })
+    ].concat(st.conflicts.slice(0, 8).map(function (c) {
+      var what = c.k.indexOf("day:") === 0 ? "Day " + c.k.slice(4) : c.k.replace("blob:", "List: ");
+      return E.el("p", { class: "small", text: what + " — kept the " + c.winner + "'s version (" + new Date(c.at).toLocaleString() + "). Other version: " +
+        JSON.stringify(c.winner === "this device" ? c.remote : c.local).slice(0, 160) });
+    })) : [];
+
+    var del = [];
+    if (!syncUi.confirmDelete) {
+      del.push(chip("DELETE THE UPLOADED COPY…", false, function () { syncUi.confirmDelete = true; E.refresh(); }));
+    } else {
+      del.push(E.el("p", { class: "small", text: "This removes every row epok uploaded from the database and turns sync off here. Your log on this device is not touched." }));
+      del.push(E.el("div", { class: "row" }, [
+        chip("YES, DELETE THE UPLOADED COPY", false, function () {
+          syncUi.confirmDelete = false;
+          Y.deleteRemote().then(function (n) { syncUi.message = "Deleted " + n + " row" + (n === 1 ? "" : "s") + " from the database. Sync is off."; E.refresh(); },
+            function (err) { syncUi.error = err.message; E.refresh(); });
+        }),
+        chip("CANCEL", false, function () { syncUi.confirmDelete = false; E.refresh(); })
+      ]));
+    }
+
+    return group("SYNC", lines.concat([E.el("div", { class: "row" }, actions)], conflicts, [E.el("hr", { class: "rule" })], del));
+  }
+
   function downloadFallback(blob, filename) {
     var url = URL.createObjectURL(blob);
     var a = document.createElement("a");
@@ -616,11 +789,13 @@
       E.el("h1", { text: "SETTINGS", style: "margin-bottom:var(--s4)" }),
       profileSection(profile),
       contraceptionSection(profile),
+      eventsSection(),
       remindersSection(profile),
       lockSection(),
       appearanceSection(profile),
       tagsSection(profile),
       dataSection(),
+      syncSection(),
       pastPeriodSection(),
       clueSection()
     ]);

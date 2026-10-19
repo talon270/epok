@@ -38,7 +38,7 @@ URL = APP.as_uri()
 
 THEMES = ["quasar", "arasaka", "chernobyl", "monolith"]
 MODES = ["dark", "light"]
-VIEWS = ["today", "calendar", "insights", "settings", "report"]
+VIEWS = ["today", "calendar", "timeline", "insights", "settings", "report"]
 WIDTHS = [1920, 1440, 400]
 
 # AA. 4.5:1 for body text, 3:1 for large text and for UI lines that carry
@@ -697,7 +697,7 @@ def check_reminders(browser) -> None:
     v1["profile"]["remindersOn"] = True
     ctx, page, errs = new_page(browser, seed={"epok.state.v1": json.dumps(v1)})
     st = page.evaluate("() => Epok.Store.get()")
-    check(st["v"] == 2, "v1 state migrates to v2", str(st["v"]))
+    check(st["v"] == page.evaluate("() => Epok.SCHEMA_VERSION"), "v1 state migrates through to the current schema", str(st["v"]))
     r = st["profile"]["reminders"]
     check(r == {"predictedStart": False, "pms": False, "pill": False, "pillTime": "21:00"},
           "v2 adds every reminder switched OFF, even with remindersOn already true", str(r))
@@ -1053,8 +1053,12 @@ def check_calendar(browser) -> None:
     # A2: a finished cycle carries its ovulation; the charted one is confirmed.
     page.click('.rail__item[data-view="calendar"]')
     page.wait_for_timeout(150)
-    charted = [h for h in model["history"] if h["confirmed"]]
-    check(len(charted) == 1, "calendar: exactly the charted cycle is confirmed", str(len(charted)))
+    # The seed charts BBT only. One indirect signal is DETECTED, never confirmed
+    # (REVIEW-algorithm-2026-10-03 finding 2), so it must draw as an estimate.
+    charted = [h for h in model["history"] if h["ovulation"]["source"] == "bbt"]
+    check(len(charted) == 1, "calendar: exactly the charted cycle is detected from BBT", str(len(charted)))
+    check(not any(h["confirmed"] for h in model["history"]),
+          "calendar: a single signal is never called confirmed")
     if charted:
         ov = charted[0]["ovulation"]["date"]
         page.click(".cal-nav button:has-text('TODAY')")
@@ -1062,10 +1066,12 @@ def check_calendar(browser) -> None:
             page.click(".cal-nav button:has-text('PREV')")
             page.wait_for_timeout(80)
         cell = page.locator(f'.cal-day[data-date="{ov}"] .cal-day__ov')
-        check(cell.count() == 1 and "is-estimated" not in (cell.get_attribute("class") or ""),
-              "calendar: the charted ovulation renders as confirmed", ov)
+        check(cell.count() == 1 and "is-estimated" in (cell.get_attribute("class") or ""),
+              "calendar: a BBT-only ovulation renders as an estimate, not confirmed", ov)
         check(page.locator(".cal-day--peak, .cal-day--fertile").count() > 0, "calendar: a past month shows its fertile days")
-        check("CONFIRMED" in page.locator(".cal-legend").inner_text(), "calendar: the legend names what the month draws")
+        legend = page.locator(".cal-legend").inner_text()
+        check("DASHED = ESTIMATE" in legend and "CONFIRMED" not in legend,
+              "calendar: the legend names what the month draws — an estimate, with no confirmed ovulation in it", legend)
 
     # A6: past the forecast, the legend drops the window and says why.
     page.click(".cal-nav button:has-text('TODAY')")
@@ -1118,6 +1124,525 @@ def check_calendar(browser) -> None:
     ctx.close()
 
 
+def check_review(browser) -> None:
+    """REVIEW-algorithm-2026-10-03 findings 4, 5, 6 and 10, plus the v3 migration.
+    Each one is a repro from the review, driven through the real controls where
+    the control exists."""
+    ctx, page, errs = new_page(browser)
+    d = lambda n: page.evaluate("(n) => Epok.shiftDay(Epok.today(), n)", n)
+    flow_chip = lambda name: page.get_by_role("button", name=name, exact=True)
+    cyc = lambda: page.evaluate("() => Epok.Store.cycles().map(c => [c.start, c.source])")
+
+    # 4a. One SPOTTING tap is not a period, and clearing it leaves nothing behind.
+    page.click('.rail__item[data-view="today"]')
+    flow_chip("SPOTTING").click(); page.wait_for_timeout(120)
+    check(cyc() == [], "spotting alone does not create a cycle", str(cyc()))
+
+    # 4b. Real bleeding does, marked as inferred, and clearing it removes it again.
+    flow_chip("LIGHT").click(); page.wait_for_timeout(120)
+    t = d(0)
+    check(cyc() == [[t, "flow"]], "a flow tap infers a start, marked source=flow", str(cyc()))
+    flow_chip("LIGHT").click(); page.wait_for_timeout(120)
+    check(cyc() == [], "clearing the only flow day removes the start it justified", str(cyc()))
+    ctx.close()
+
+    # 4c. Backfilling the day before moves the inferred start; 4d. a manual start is never moved.
+    ctx, page, errs = new_page(browser)
+    d = lambda n: page.evaluate("(n) => Epok.shiftDay(Epok.today(), n)", n)
+    cyc = lambda: page.evaluate("() => Epok.Store.cycles().map(c => [c.start, c.source])")
+    page.evaluate("(k) => Epok.Store.editDay(k, { flow: 'medium' })", d(-3))
+    page.evaluate("(k) => Epok.Store.editDay(k, { flow: 'medium' })", d(-4))
+    check(cyc() == [[d(-4), "flow"]], "backfilling the day before moves the inferred start to it", str(cyc()))
+    page.evaluate("(k) => Epok.Store.setPeriodStart(k)", d(-40))
+    page.evaluate("(k) => Epok.Store.editDay(k, { flow: 'heavy' })", d(-41))
+    check([c for c in cyc() if c[1] == "manual"] == [[d(-40), "manual"]],
+          "a start marked by hand is not moved by an earlier flow day", str(cyc()))
+    page.evaluate("(k) => Epok.Store.editDay(k, { flow: null })", d(-41))
+    check([c for c in cyc() if c[1] == "manual"] == [[d(-40), "manual"]],
+          "clearing flow never removes a start marked by hand", str(cyc()))
+
+    # 4e. A start the user removed stays removed.
+    page.evaluate("(k) => Epok.Store.clearPeriodStart(k)", d(-4))
+    page.evaluate("(k) => Epok.Store.editDay(k, { flow: 'light' })", d(-2))
+    check(d(-4) not in [c[0] for c in cyc()] and d(-3) not in [c[0] for c in cyc()],
+          "a removed inferred start is not re-inferred by the next flow edit", str(cyc()))
+    rej = page.evaluate("() => Epok.Store.get().meta.rejectedStarts")
+    check(rej == [d(-4)], "the rejection is recorded", str(rej))
+    check(errs == [], "review/starts: console errors", "; ".join(errs))
+    ctx.close()
+
+    # v2 -> v3 migration: every existing start becomes manual, nothing is removed.
+    v2 = json.loads(json.dumps(SEEDED_STATE))
+    v2["v"] = 2
+    v2["cycles"] = [{"start": "2026-06-01", "end": None, "length": None, "ovulation": None, "ovulationSource": None},
+                    {"start": "2026-07-01", "end": None, "length": None, "ovulation": None, "ovulationSource": None}]
+    ctx, page, errs = new_page(browser, seed={"epok.state.v1": json.dumps(v2)})
+    st = page.evaluate("() => Epok.Store.get()")
+    check(st["v"] == page.evaluate("() => Epok.SCHEMA_VERSION"), "v2 state migrates through to the current schema", str(st["v"]))
+    # The seed's flow days legitimately add inferred starts after boot; what the
+    # migration owns is that the two starts it was handed are manual.
+    mine = [c["source"] for c in st["cycles"] if c["start"] in ("2026-06-01", "2026-07-01")]
+    check(mine == ["manual", "manual"] and len(mine) == 2,
+          "migration: every pre-existing start becomes manual, none inferred", str([(c["start"], c.get("source")) for c in st["cycles"]]))
+    check(st["meta"]["rejectedStarts"] == [] and "checkin" in st["days"]["2026-08-18"],
+          "migration: rejectedStarts and day.checkin added")
+    check(errs == [], "review/migration: console errors", "; ".join(errs))
+    ctx.close()
+
+    # Helper: build N regular 28-day cycles ending `back` days ago, with a 5-day
+    # bleed each carrying CRAMPS, then BBT-only readings on 60 other days.
+    BUILD = """(args) => {
+      const [nCycles, lastStartBack, extra] = args, S = Epok.Store.get();
+      S.days = {}; S.cycles = []; S.meta.rejectedStarts = [];
+      for (let i = 0; i < nCycles; i++) {
+        const start = Epok.shiftDay(Epok.today(), -(lastStartBack + 28 * (nCycles - 1 - i)));
+        S.cycles.push({ start, end: Epok.shiftDay(start, 4), length: null, ovulation: null, ovulationSource: null, source: 'manual' });
+        for (let k = 0; k < 5; k++) S.days[Epok.shiftDay(start, k)] = { flow: 'medium', tags: ['cramps'], bbt: null, lh: null, pill: null, note: '', checkin: false };
+      }
+      let n = 0;
+      for (let k = 6; n < 60 && k < 400; k++) {
+        const key = Epok.shiftDay(Epok.today(), -k);
+        if (S.days[key] || S.cycles.some(c => Epok.daysBetween(c.start, key) >= 0 && Epok.daysBetween(c.start, key) <= 4)) continue;
+        S.days[key] = { flow: null, tags: extra === 'mood' ? ['low-mood'] : [], bbt: 36.4, lh: null, pill: null, note: '', checkin: extra === 'checkin' };
+        n++;
+      }
+      return Epok.Store.flush();
+    }"""
+
+    def patterns(extra):
+        c, pg, e = new_page(browser)
+        pg.evaluate(BUILD, [4, 6, extra])
+        pg.reload(); pg.wait_for_timeout(300)
+        pg.click('.rail__item[data-view="insights"]'); pg.wait_for_timeout(200)
+        txt = pg.locator("#main").inner_text()
+        check(e == [], f"review/insights({extra}): console errors", "; ".join(e))
+        c.close()
+        return txt
+
+    # 10. Same cramps, same cycle dates; only unrelated logging differs.
+    check("CRAMPS on" not in patterns("none"), "patterns: BBT-only days give no cramps pattern")
+    check("CRAMPS on" not in patterns("mood"),
+          "patterns: an unrelated MOOD tag on those days must not create a cramps pattern")
+    check("CRAMPS on" in patterns("checkin"),
+          "patterns: days explicitly checked in with no symptoms DO count as cramp-free")
+
+    # 5 + 6. A suppressing method pauses the card; a long-overdue forecast says it expired.
+    ctx, page, errs = new_page(browser)
+    page.evaluate(BUILD, [5, 60, "none"])
+    page.reload(); page.wait_for_timeout(300)
+    page.click('.rail__item[data-view="today"]'); page.wait_for_timeout(200)
+    txt = page.locator("#main").inner_text()
+    check("EXPIRED FORECAST" in txt, "today: a window that ended weeks ago is headed EXPIRED FORECAST", txt[:300])
+    page.evaluate("() => Epok.Store.setProfile({ contraception: 'combined-21-7' })")
+    page.evaluate("() => Epok.refresh()"); page.wait_for_timeout(200)
+    txt = page.locator("#main").inner_text()
+    check("PREDICTION PAUSED" in txt and "suppresses ovulation" in txt,
+          "today: a combined pill pauses the natural-cycle card and says why", txt[:300])
+    check(page.locator('#main :text("PREDICTED NEXT START")').count() == 0,
+          "today: no predicted date is shown while paused")
+    check(errs == [], "review/pause: console errors", "; ".join(errs))
+    ctx.close()
+
+
+def check_features(browser) -> None:
+    """PLAN-features-sync.md A1-A5: timeline, forecast history, severity,
+    temperature notes, events. Real clicks wherever a control exists."""
+    # N regular 28-day cycles, last one starting `back` days ago, each with a bleed.
+    BUILD = """(args) => {
+      const [n, back, lens] = args, S = Epok.Store.get();
+      S.days = {}; S.cycles = []; S.predictions = []; S.events = [];
+      let start = -(back + (lens ? lens.reduce((a, b) => a + b, 0) : 28 * (n - 1)));
+      for (let i = 0; i < n; i++) {
+        const k = Epok.shiftDay(Epok.today(), start);
+        S.cycles.push({ start: k, end: Epok.shiftDay(k, 4), length: null, ovulation: null, ovulationSource: null, source: 'manual', excluded: false });
+        for (let j = 0; j < 5; j++) S.days[Epok.shiftDay(k, j)] = { flow: 'medium', tags: [], bbt: null, lh: null, pill: null, note: '', checkin: false, severity: {}, impact: null, bbtMeta: null };
+        start += lens ? lens[i] : 28;
+      }
+      return Epok.Store.flush();
+    }"""
+
+    # A1. Timeline: one card per cycle, a long cycle is flagged not edited, exclude/move/remove act and undo.
+    ctx, page, errs = new_page(browser)
+    page.evaluate(BUILD, [5, 10, [28, 28, 70, 28]])
+    page.reload(); page.wait_for_timeout(300)
+    page.click('.rail__item[data-view="timeline"]'); page.wait_for_timeout(200)
+    check(page.locator("[data-cycle]").count() == 5, "timeline: one card per cycle", str(page.locator("[data-cycle]").count()))
+    txt = page.locator("#main").inner_text()
+    check("LONG — 70 days" in txt and "missed entry" in txt and "real long cycle" in txt,
+          "timeline: a 70-day cycle is flagged with both readings", txt[:200])
+    check(page.evaluate("() => Epok.Store.cycles().length") == 5, "timeline: flagging a long cycle changes nothing")
+    longcard = page.locator("[data-cycle]").filter(has_text="LONG — 70 days")
+    longcard.get_by_role("button", name="LEAVE OUT OF THE FIT").click(); page.wait_for_timeout(150)
+    check(page.evaluate("() => Epok.Store.cycles().filter(c => c.excluded).length") == 1, "timeline: leave out sets cycle.excluded")
+    check("LEFT OUT OF THE FIT" in page.locator("#main").inner_text(), "timeline: the excluded cycle says so")
+    page.locator("[data-cycle]").filter(has_text="LEFT OUT").get_by_role("button", name="COUNT IN THE FIT").click(); page.wait_for_timeout(150)
+    check(page.evaluate("() => Epok.Store.cycles().filter(c => c.excluded).length") == 0, "timeline: count in clears it")
+    newest = page.locator("[data-cycle]").first
+    newest.get_by_role("button", name="MOVE START").click(); page.wait_for_timeout(100)
+    start = page.evaluate("() => Epok.Store.cycles().slice(-1)[0].start")
+    target = page.evaluate("(k) => Epok.shiftDay(k, -9)", start)
+    page.locator("[data-cycle] input[type=date]").first.fill(target)
+    page.wait_for_timeout(80)
+    check("Moving to" in page.locator("#main").inner_text() and "goes from" in page.locator("#main").inner_text(),
+          "timeline: a move states its consequence before it is made")
+    page.get_by_role("button", name="MOVE", exact=True).click(); page.wait_for_timeout(150)
+    check(page.evaluate("() => Epok.Store.cycles().slice(-1)[0].start") == target and
+          page.evaluate("() => Epok.Store.cycles().slice(-1)[0].source") == "manual",
+          "timeline: move start applies and becomes manual")
+    r = page.evaluate("(k) => Epok.Store.moveStart(k, Epok.shiftDay(Epok.Store.cycles()[3].start, 3))", target)
+    check(r["ok"] is False and "within" in r["error"], "timeline: a move onto a neighbour is refused inline", str(r))
+    check(errs == [], "features/timeline: console errors", "; ".join(errs))
+    ctx.close()
+
+    # A3. Severity and impact: per-tag 1-3 appears only for tags that are on and is dropped with the tag.
+    ctx, page, errs = new_page(browser)
+    page.click('.rail__item[data-view="today"]'); page.wait_for_timeout(150)
+    page.get_by_role("button", name="CRAMPS", exact=True).click(); page.wait_for_timeout(150)
+    page.locator(".small-block", has_text="HOW BAD").get_by_role("button", name="2", exact=True).click(); page.wait_for_timeout(120)
+    day = page.evaluate("() => Epok.Store.day()")
+    check(day["severity"] == {"cramps": 2}, "severity: a rating is stored per tag", str(day["severity"]))
+    page.get_by_role("button", name="A LOT", exact=True).click(); page.wait_for_timeout(120)
+    check(page.evaluate("() => Epok.Store.day().impact") == "a-lot", "impact: stored")
+    page.get_by_role("button", name="CRAMPS", exact=True).click(); page.wait_for_timeout(150)
+    check(page.evaluate("() => Epok.Store.day().severity") == {}, "severity: removing the tag drops its rating")
+    check("Symptom record:" in page.locator("#main").inner_text(), "check-in: the completeness line is shown")
+
+    # A4. Temperature notes: shown only with a reading, disturbed flag stored, cleared with the reading.
+    check("HOW IT WAS TAKEN" not in page.locator("#main").inner_text(), "bbt: no notes block without a reading")
+    page.get_by_label("Basal body temperature in Celsius").fill("36.55"); page.get_by_label("Basal body temperature in Celsius").blur(); page.wait_for_timeout(200)
+    page.locator(".small-block", has_text="HOW IT WAS TAKEN").get_by_role("button", name="ALCOHOL", exact=True).click(); page.wait_for_timeout(150)
+    check(page.evaluate("() => Epok.Store.day().bbtMeta") == {"time": None, "disturbed": "alcohol"}, "bbt: disturbed flag stored")
+    check("left out when epok looks for a temperature rise" in page.locator("#main").inner_text(), "bbt: a flagged reading says it is excluded")
+    page.get_by_label("Basal body temperature in Celsius").fill(""); page.get_by_label("Basal body temperature in Celsius").blur(); page.wait_for_timeout(200)
+    check(page.evaluate("() => Epok.Store.day().bbtMeta") is None, "bbt: clearing the reading clears its notes")
+    check(errs == [], "features/severity+bbt: console errors", "; ".join(errs))
+    ctx.close()
+
+    # A5. Events: open pregnancy pauses and ends; a method change leaves a closed event; bad dates refused inline.
+    ctx, page, errs = new_page(browser)
+    page.evaluate(BUILD, [5, 10, None])
+    page.reload(); page.wait_for_timeout(300)
+    page.click('.rail__item[data-view="today"]'); page.wait_for_timeout(200)
+    check("PREDICTED NEXT START" in page.locator("#main").inner_text(), "events: a forecast shows before any event")
+    page.get_by_role("button", name="+ PREGNANCY").click(); page.wait_for_timeout(200)
+    txt = page.locator("#main").inner_text()
+    check("PREDICTION PAUSED" in txt and "pregnancy span is open" in txt, "events: an open pregnancy pauses the forecast, with its reason", txt[:300])
+    page.get_by_role("button", name="END TODAY").click(); page.wait_for_timeout(200)
+    check("PREDICTION PAUSED" not in page.locator("#main").inner_text(), "events: ending it lifts the pause")
+    check(page.evaluate("() => Epok.Store.get().events.length") == 1, "events: the ended span stays on record")
+    r = page.evaluate("() => Epok.Store.addEvent({ type: 'medication', from: '2026-05-10', to: '2026-05-01' })")
+    check(r["ok"] is False and "before the start" in r["error"], "events: an end before the start is refused inline", str(r))
+    page.evaluate("() => { Epok.Store.setProfile({ contraception: 'ring' }); Epok.Store.setProfile({ contraception: null }); }")
+    evs = page.evaluate("() => Epok.Store.get().events.filter(e => e.type === 'contraception')")
+    check(len(evs) == 1 and evs[0]["method"] == "ring" and evs[0]["to"] is not None,
+          "events: stopping a method closes its event instead of erasing it", str(evs))
+    check(errs == [], "features/events: console errors", "; ".join(errs))
+    ctx.close()
+
+    # A2. Forecast snapshots are written, settled when the next start arrives, and labelled as few.
+    ctx, page, errs = new_page(browser)
+    page.evaluate(BUILD, [5, 20, None])
+    page.reload(); page.wait_for_timeout(300)
+    page.evaluate("() => Epok.Store.flush()"); page.wait_for_timeout(100)
+    preds = page.evaluate("() => Epok.Store.get().predictions")
+    check(len(preds) >= 1 and preds[-1]["actual"] is None and preds[-1]["modelVersion"] >= 2,
+          "snapshots: a forecast is saved with its engine version and is pending", str(preds[-1:] ))
+    page.evaluate("() => Epok.Store.setPeriodStart(Epok.shiftDay(Epok.today(), -1))")
+    page.evaluate("() => Epok.Store.flush()"); page.wait_for_timeout(150)
+    preds = page.evaluate("() => Epok.Store.get().predictions")
+    settled = [p for p in preds if p["actual"] is not None]
+    check(len(settled) >= 1 and isinstance(settled[0]["errorDays"], int) and isinstance(settled[0]["inWindow"], bool),
+          "snapshots: logging the next start settles the forecast against it", str(settled[:1]))
+    page.click('.rail__item[data-view="insights"]'); page.wait_for_timeout(200)
+    txt = page.locator("#main").inner_text()
+    check("FORECAST HISTORY" in txt and "settled so far" in txt and "RECONSTRUCTED" in txt,
+          "snapshots: with fewer than 6 settled, the card says the headline error is reconstructed", txt[:200])
+    check(errs == [], "features/snapshots: console errors", "; ".join(errs))
+    ctx.close()
+
+    # A6. Report: range, completeness, prolonged bleeding, events, severity, phase basis.
+    ctx, page, errs = new_page(browser)
+    page.evaluate(BUILD, [6, 10, None])
+    page.evaluate("""() => {
+      const S = Epok.Store.get(), st = S.cycles[2].start;
+      for (let j = 5; j < 9; j++) S.days[Epok.shiftDay(st, j)] = { flow: 'light', tags: [], bbt: null, lh: null, pill: null, note: '', checkin: false, severity: {}, impact: null, bbtMeta: null };
+      const t = S.cycles[4].start;
+      S.days[t] = Object.assign(S.days[t], { tags: ['cramps'], severity: { cramps: 3 }, impact: 'a-lot', checkin: true });
+      S.events.push({ id: 'e1', type: 'medication', method: null, from: Epok.shiftDay(Epok.today(), -60), to: null, note: 'iron' });
+      return Epok.Store.flush();
+    }""")
+    page.reload(); page.wait_for_timeout(300)
+    page.click('.rail__item[data-view="report"]'); page.wait_for_timeout(250)
+    txt = page.locator("#main").inner_text()
+    check("SELF-REPORTED" in txt and "HOW COMPLETE THIS LOG IS" in txt and "temperature on 0%" in txt,
+          "report: header, and a completeness line that says what is missing", txt[:300])
+    check("1 bleeding episode" not in txt and "lasted more than 7 days: " in txt and "(9 days)" in txt,
+          "report: a 9-day bleeding episode is flagged as prolonged", txt[txt.find("BLEEDING"):txt.find("BLEEDING") + 260])
+    check("medication: " in txt and "(iron)" in txt and "ongoing" in txt, "report: events appear with their dates and note")
+    check("3.0 of 3" in txt and "SELF-RATED SEVERITY" in txt and "Phase basis:" in txt,
+          "report: symptoms carry the user's own severity and say how phases were placed", txt[txt.find("SYMPTOMS"):txt.find("SYMPTOMS") + 300])
+    check("affected \"a lot\"" in txt, "report: days affected a lot are counted")
+    n12 = page.evaluate("() => document.querySelectorAll('.report-page tbody tr').length")
+    page.get_by_role("button", name="3 MONTHS", exact=True).click(); page.wait_for_timeout(200)
+    n3 = page.evaluate("() => document.querySelectorAll('.report-page tbody tr').length")
+    check(n3 < n12, "report: a shorter range lists fewer cycles", f"{n3} vs {n12}")
+    check("Cycles started in this range: " in page.locator("#main").inner_text(), "report: the summary says it is for the range")
+    check(errs == [], "features/report: console errors", "; ".join(errs))
+    ctx.close()
+
+    # Migration v3 -> v4.
+    v3 = json.loads(json.dumps(SEEDED_STATE)); v3["v"] = 3
+    v3["profile"]["contraception"] = "ring"; v3["profile"]["contraceptionStart"] = "2026-06-01"
+    v3["days"]["2026-08-18"].pop("checkin", None)
+    ctx, page, errs = new_page(browser, seed={"epok.state.v1": json.dumps(v3)})
+    st = page.evaluate("() => Epok.Store.get()")
+    check(st["v"] == 4 and any(e["type"] == "contraception" and e["method"] == "ring" and e["to"] is None and e["from"] == "2026-06-01" for e in st["events"]),
+          "migration v3->v4: the current method becomes an open event", str(st["events"]))
+    check(st["profile"]["contraception"] == "ring" and st["profile"]["contraceptionStart"] == "2026-06-01",
+          "migration v3->v4: the profile fields are left exactly as they were")
+    check(all(c["excluded"] is False for c in st["cycles"]) and st["days"]["2026-08-18"]["severity"] == {},
+          "migration v3->v4: new fields default, nothing removed")
+    check(errs == [], "features/migration: console errors", "; ".join(errs))
+    ctx.close()
+
+
+def check_calendar_three(browser) -> None:
+    """B1/B2: the three-month view, keyboard, jump-to-date and quick log."""
+    for scheme in ("dark", "light"):
+        ctx, page, errs = new_page(browser, width=1920, height=1000, colour_scheme=scheme)
+        page.click('.rail__item[data-view="calendar"]'); page.wait_for_timeout(200)
+        check(page.locator(".cal-grid").count() == 1, f"cal3 [{scheme}]: month view is one grid by default")
+        page.get_by_role("button", name="3 MONTHS", exact=True).click(); page.wait_for_timeout(200)
+        check(page.locator(".cal-grid").count() == 3 and page.locator(".cal--three").count() == 1,
+              f"cal3 [{scheme}]: 3 MONTHS draws three grids")
+        title = page.locator(".cal-nav h1").inner_text()
+        check("–" in title, f"cal3 [{scheme}]: the title spans the months", title)
+        boxes = page.evaluate("""() => [...document.querySelectorAll('.cal-three > .card')].map(e => { const r = e.getBoundingClientRect(); return [r.left, r.right, r.top]; })""")
+        check(len(boxes) == 3 and boxes[0][1] <= boxes[1][0] + 1 and boxes[1][1] <= boxes[2][0] + 1 and abs(boxes[0][2] - boxes[2][2]) < 2,
+              f"cal3 [{scheme}]: at 1920 the three months sit side by side", str(boxes))
+        main = page.evaluate("() => { const r = document.getElementById('main').getBoundingClientRect(); return [r.left, r.right]; }")
+        left_gap, right_gap = boxes[0][0] - main[0], main[1] - boxes[2][1]
+        check(abs(left_gap - right_gap) <= 2 and (boxes[2][1] - boxes[0][0]) > 1400,
+              f"cal3 [{scheme}]: 1920 — the months fill the page, centred, no stranded space", f"gaps {left_gap:.0f}/{right_gap:.0f}, width {boxes[2][1]-boxes[0][0]:.0f}")
+        check(page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"),
+              f"cal3 [{scheme}]: no horizontal overflow")
+        check(errs == [], f"cal3 [{scheme}]: console errors", "; ".join(errs))
+        ctx.close()
+
+    ctx, page, errs = new_page(browser, width=1440, height=950)
+    page.click('.rail__item[data-view="calendar"]'); page.wait_for_timeout(200)
+    page.get_by_role("button", name="3 MONTHS", exact=True).click(); page.wait_for_timeout(200)
+    check(page.evaluate("() => localStorage.getItem('epok.cal.mode')") == "three", "cal3: the view choice is remembered")
+    page.reload(); page.wait_for_timeout(300)
+    check(page.locator(".cal-grid").count() == 3, "cal3: it survives a reload")
+
+    # Keyboard: arrows move the selected day, PageDown the month, T returns, ? lists them.
+    sel0 = page.locator(".cal-day.is-selected").get_attribute("data-date")
+    page.keyboard.press("ArrowRight"); page.wait_for_timeout(120)
+    sel1 = page.locator(".cal-day.is-selected").get_attribute("data-date")
+    check(sel1 == page.evaluate("(k) => Epok.shiftDay(k, 1)", sel0), "cal3: ArrowRight selects the next day", f"{sel0} -> {sel1}")
+    page.keyboard.press("ArrowDown"); page.wait_for_timeout(120)
+    check(page.locator(".cal-day.is-selected").get_attribute("data-date") == page.evaluate("(k) => Epok.shiftDay(k, 8)", sel0),
+          "cal3: ArrowDown moves a week")
+    t0 = page.locator(".cal-nav h1").inner_text()
+    page.keyboard.press("PageDown"); page.wait_for_timeout(120)
+    check(page.locator(".cal-nav h1").inner_text() != t0, "cal3: PageDown changes month")
+    page.keyboard.press("t"); page.wait_for_timeout(120)
+    check(page.locator(".cal-nav h1").inner_text() == t0, "cal3: T returns to today")
+    page.keyboard.press("?"); page.wait_for_timeout(120)
+    check("KEYBOARD" in page.locator(".cal-help").inner_text(), "cal3: ? lists the shortcuts")
+    page.keyboard.press("1"); page.wait_for_timeout(120)
+    check(page.locator(".cal-grid").count() == 1, "cal3: 1 returns to a single month")
+
+    # Jump to date, and quick log from the panel without leaving the calendar.
+    past = page.evaluate("() => Epok.shiftDay(Epok.today(), -75)")
+    page.locator(".cal-jump").fill(past); page.locator(".cal-jump").dispatch_event("change"); page.wait_for_timeout(200)
+    check(page.locator(".cal-day.is-selected").get_attribute("data-date") == past, "cal3: jump-to-date selects that day")
+    page.get_by_role("button", name="MEDIUM", exact=True).click(); page.wait_for_timeout(200)
+    check(page.evaluate("(k) => Epok.Store.day(k).flow", past) == "medium" and page.evaluate("() => location.hash") == "#calendar",
+          "cal3: quick log sets flow on that day and stays on the calendar")
+    check(page.locator(".cal-day.is-selected").get_attribute("data-date") == past, "cal3: the selection survives a quick log")
+    page.get_by_role("button", name="CHECKED IN", exact=True).click(); page.wait_for_timeout(150)
+    check(page.evaluate("(k) => Epok.Store.day(k).checkin", past) is True, "cal3: quick check-in")
+    check(errs == [], "cal3: console errors", "; ".join(errs))
+    ctx.close()
+
+    ctx, page, errs = new_page(browser, width=400, height=800)
+    page.click('.rail__item[data-view="calendar"]'); page.wait_for_timeout(200)
+    page.get_by_role("button", name="3 MONTHS", exact=True).click(); page.wait_for_timeout(200)
+    boxes = page.evaluate("""() => [...document.querySelectorAll('.cal-three > .card')].map(e => e.getBoundingClientRect().top)""")
+    check(len(boxes) == 3 and boxes[0] < boxes[1] < boxes[2], "cal3: at 400px the months stack", str(boxes))
+    check(page.evaluate("() => document.documentElement.scrollWidth <= document.documentElement.clientWidth"), "cal3: 400px has no horizontal overflow")
+    check(errs == [], "cal3: 400px console errors", "; ".join(errs))
+    ctx.close()
+
+
+def check_sync(browser) -> None:
+    """Opt-in sync against tools/mock_turso.py. The mock is NOT Turso: this proves
+    js/sync.js behaves as designed on the documented request shape, and says
+    nothing about CORS or acceptance by a real Turso endpoint (PLAN C0)."""
+    import pathlib, socket, subprocess, urllib.request
+
+    root = pathlib.Path(__file__).resolve().parent
+    token = "test-token-not-a-secret"
+    PASS = "correct horse battery"
+
+    def free_port() -> int:
+        sk = socket.socket(); sk.bind(("127.0.0.1", 0)); p = sk.getsockname()[1]; sk.close(); return p
+
+    class Mock:
+        def __init__(self, port: int | None = None):
+            self.port = port or free_port()
+            self.proc = subprocess.Popen([sys.executable, str(root / "mock_turso.py"), "--port", str(self.port), "--token", token],
+                                         stdout=subprocess.PIPE, text=True)
+            assert self.proc.stdout.readline().strip() == "READY"
+        def dump(self) -> dict:
+            req = urllib.request.Request(f"http://127.0.0.1:{self.port}/__dump", headers={"Authorization": f"Bearer {token}"})
+            return json.loads(urllib.request.urlopen(req, timeout=5).read())
+        def stop(self) -> None:
+            self.proc.terminate(); self.proc.wait(timeout=5)
+
+    def fill(page, label, value):
+        loc = page.get_by_label(label, exact=True)
+        loc.fill(value); loc.blur()
+
+    def enable(page, port, passphrase=PASS, repeat=None):
+        page.click('.rail__item[data-view="settings"]'); page.wait_for_timeout(250)
+        fill(page, "Database URL", f"http://127.0.0.1:{port}")
+        fill(page, "Database token", token)
+        fill(page, "Sync passphrase", passphrase)
+        fill(page, "Repeat the sync passphrase", repeat or passphrase)
+        page.get_by_role("button", name="I UNDERSTAND A LOST PASSPHRASE CANNOT BE RECOVERED").click(); page.wait_for_timeout(100)
+        page.get_by_role("button", name="TURN ON SYNC", exact=True).click()
+
+    def wait_text(page, needle, ms=20000):
+        page.wait_for_function("(t) => document.getElementById('main').innerText.includes(t)", arg=needle, timeout=ms)
+
+    def sync_now(page):
+        return page.evaluate("() => Epok.Sync.syncNow().then(s => s, e => ({ error: e.message, kind: e.kind }))")
+
+    m = Mock()
+    ctxA, A, errsA = new_page(browser, width=1440, height=950)
+    A.evaluate("""() => { const d = n => Epok.shiftDay(Epok.today(), n);
+      Epok.Store.setPeriodStart(d(-60)); Epok.Store.setPeriodStart(d(-30));
+      Epok.Store.editDay(d(-10), { note: 'from A', tags: ['cramps'] }); Epok.Store.editDay(d(-9), { note: 'second' });
+      document.querySelectorAll('.undo').forEach(n => n.remove()); return Epok.Store.flush(); }""")
+    day10 = A.evaluate("() => Epok.shiftDay(Epok.today(), -10)")
+
+    # Guards before anything is sent.
+    enable(A, m.port, repeat="something else entirely"); A.wait_for_timeout(300)
+    check("passphrases differ" in A.locator("#main").inner_text() and m.dump()["records"] == [],
+          "sync: mismatched passphrases are refused inline and upload nothing")
+    fill(A, "Repeat the sync passphrase", PASS)
+    A.get_by_role("button", name="TURN ON SYNC", exact=True).click(); wait_text(A, "Sync is on.")
+    check(A.evaluate("() => Epok.Sync.status().configured && Epok.Sync.status().unlocked"), "sync: set up and unlocked on device A")
+
+    # What the database holds.
+    d = m.dump(); recs = d["records"]
+    check(len(recs) >= 6 and {r["kind"] for r in recs} <= {"day", "blob"}, "sync: one row per day plus the lists", str(len(recs)))
+    blob = json.dumps(d)
+    check("from A" not in blob and "cramps" not in blob and not re.search(r"20\d\d-\d\d-\d\d", blob),
+          "sync: the database holds no readable note, tag or date — ids, hashes and payloads are opaque")
+    exported = A.evaluate("() => Epok.Store.exportJSON().text()")
+    check(token not in exported and token not in A.evaluate("() => localStorage.getItem('epok.state.v1')"),
+          "sync: the token is in neither the backup export nor the state")
+
+    # Device B joins; a wrong passphrase is refused before it uploads anything.
+    ctxB, B, errsB = new_page(browser, width=1440, height=950)
+    before = len(m.dump()["records"])
+    enable(B, m.port, passphrase="wrong passphrase!!"); wait_text(B, "does not open the data already in this database")
+    check(len(m.dump()["records"]) == before and B.evaluate("() => Epok.Sync.status().configured") is False,
+          "sync: a wrong passphrase is refused and B uploads and stores nothing")
+    fill(B, "Sync passphrase", PASS); fill(B, "Repeat the sync passphrase", PASS)
+    B.get_by_role("button", name="TURN ON SYNC", exact=True).click(); wait_text(B, "Sync is on.")
+    check(B.evaluate("(k) => Epok.Store.day(k).note", day10) == "from A" and B.evaluate("() => Epok.Store.cycles().length") == 2,
+          "sync: device B receives A's days and cycles", B.evaluate("(k) => JSON.stringify(Epok.Store.day(k))", day10))
+
+    r = sync_now(A)
+    check(A.evaluate("() => Epok.Store.cycles().length") == 2 and r.get("conflicts") == 0,
+          "sync: a fresh device joining does not overwrite A's cycles with its empty list", str(r))
+
+    # A change on one side only is not a conflict.
+    B.evaluate("(k) => Epok.Store.editDay(k, { note: 'B edit one' })", day10)
+    r = sync_now(B); check(r.get("pushed", 0) >= 1, "sync: B pushes its edit", str(r))
+    r = sync_now(A)
+    check(A.evaluate("(k) => Epok.Store.day(k).note", day10) == "B edit one" and r.get("conflicts") == 0,
+          "sync: A receives it with no conflict", str(r))
+
+    # The same record changed on both: the newer edit wins and the other is kept.
+    A.evaluate("() => Epok.Sync.setEnabled(false)")
+    A.evaluate("(k) => Epok.Store.editDay(k, { note: 'A edit older' })", day10)
+    A.wait_for_timeout(1100)
+    B.evaluate("(k) => Epok.Store.editDay(k, { note: 'B edit newer' })", day10)
+    sync_now(B)
+    A.evaluate("() => Epok.Sync.setEnabled(true)")
+    r = sync_now(A)
+    check(r.get("conflicts") == 1 and A.evaluate("(k) => Epok.Store.day(k).note", day10) == "B edit newer",
+          "sync: a two-sided change keeps the newer edit and reports one conflict", str(r))
+    A.click('.rail__item[data-view="settings"]'); A.wait_for_timeout(250)
+    ct = A.locator("#main").inner_text()
+    check("CONFLICTS" in ct and "A edit older" in ct, "sync: the losing version is listed so it can be read", ct[ct.find("CONFLICTS"):ct.find("CONFLICTS") + 240])
+    check(A.evaluate("() => localStorage.getItem('epok.state.prev')") is not None, "sync: epok.state.prev holds the state a pull overwrote")
+
+    # A new session starts locked, visibly, and needs the passphrase.
+    A.reload(); A.wait_for_timeout(400)
+    check(A.locator('[data-banner="sync"]').count() == 1 and "locked for this session" in A.locator('[data-banner="sync"]').inner_text(),
+          "sync: a new session says sync is locked, in a banner, not silently")
+    A.click('.rail__item[data-view="settings"]'); A.wait_for_timeout(250)
+    fill(A, "Sync passphrase", "not it at all"); A.get_by_role("button", name="UNLOCK SYNC").click(); wait_text(A, "not the sync passphrase")
+    fill(A, "Sync passphrase", PASS); A.get_by_role("button", name="UNLOCK SYNC").click(); wait_text(A, "Synced.")
+    check(A.locator('[data-banner="sync"]').count() == 0, "sync: unlocking clears the banner")
+
+    # Unreachable database: said plainly, local log unaffected.
+    days_before = A.evaluate("() => Object.keys(Epok.Store.get().days).length")
+    m.stop()
+    A.evaluate("(k) => Epok.Store.editDay(k, { note: 'written offline' })", day10)
+    r = sync_now(A)
+    check(r.get("kind") == "network" and "Could not reach" in r.get("error", ""), "sync: an unreachable database is reported as such", str(r))
+    bn = A.locator('[data-banner="sync"]')
+    check(bn.count() == 1 and "Last good sync" in bn.inner_text(), "sync: the banner gives the age of the last good sync", bn.inner_text() if bn.count() else "")
+    check(A.evaluate("(k) => Epok.Store.day(k).note", day10) == "written offline", "sync: the local log keeps working offline")
+
+    # A reset database must not erase the local log.
+    m2 = Mock(m.port)
+    r = sync_now(A)
+    check(r.get("kind") == "reset", "sync: a database that lost its sync data is refused, not read as 'everything deleted'", str(r))
+    check(A.evaluate("() => Object.keys(Epok.Store.get().days).length") == days_before and
+          A.evaluate("(k) => Epok.Store.day(k).note", day10) == "written offline",
+          "sync: the local log is untouched by a reset database")
+    m2.stop()
+
+    # Teardown on a fresh device: the uploaded copy goes, the local log stays.
+    m3 = Mock()
+    ctxC, C, errsC = new_page(browser, width=1440, height=950)
+    C.evaluate("() => { Epok.Store.editDay(Epok.shiftDay(Epok.today(), -3), { note: 'keep me' }); return Epok.Store.flush(); }")
+    enable(C, m3.port); wait_text(C, "Sync is on.")
+    check(len(m3.dump()["records"]) >= 2, "sync: C uploaded something to delete")
+    C.get_by_role("button", name="DELETE THE UPLOADED COPY…").click(); C.wait_for_timeout(150)
+    C.get_by_role("button", name="YES, DELETE THE UPLOADED COPY").click(); wait_text(C, "Deleted ")
+    d3 = m3.dump()
+    check(d3["records"] == [] and d3["meta"] == [], "sync: delete-the-uploaded-copy empties the database")
+    check(C.evaluate("() => localStorage.getItem('epok.sync.v1')") is None and
+          C.evaluate("(k) => Epok.Store.day(k).note", C.evaluate("() => Epok.shiftDay(Epok.today(), -3)")) == "keep me",
+          "sync: it forgets the config here and leaves the local log alone")
+    m3.stop()
+
+    # The repo and the deploy copy carry no database credential.
+    leaked = []
+    for base in (root.parent / "js", root.parent / "deploy" / "public"):
+        if base.exists():
+            for f in base.rglob("*"):
+                if f.is_file() and f.suffix in (".js", ".html", ".json", ".webmanifest"):
+                    if re.search(r"eyJ[A-Za-z0-9_-]{20,}", f.read_text(errors="ignore")):
+                        leaked.append(str(f))
+    check(not leaked, "sync: no JWT-shaped database token in js/ or the deploy copy", str(leaked))
+
+    for name, e in (("A", errsA), ("B", errsB), ("C", errsC)):
+        e = [x for x in e if "net::ERR_CONNECTION_REFUSED" not in x and "Failed to load resource" not in x]
+        check(e == [], f"sync: console errors on device {name}", "; ".join(e))
+    ctxA.close(); ctxB.close(); ctxC.close()
+
+
 SECTIONS = {
     "completion": check_completion,
     "tags": check_custom_tags,
@@ -1135,6 +1660,10 @@ SECTIONS = {
     "contrast": check_contrast,
     "layout": check_layout,
     "calendar": check_calendar,
+    "review": check_review,
+    "features": check_features,
+    "calendar3": check_calendar_three,
+    "sync": check_sync,
 }
 
 

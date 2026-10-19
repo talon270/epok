@@ -304,7 +304,19 @@
     disable: disable,
     screen: screen,
     backupName: backupName,
-    download: download
+    download: download,
+
+    /* Another tab saved a sealed state. Only the key this tab unlocked with
+       can open it; a locked tab returns false and keeps waiting for the PIN. */
+    adoptSealed: function (raw) {
+      if (SESSION_KEY === null) return Promise.resolve(false);
+      var env;
+      try { env = JSON.parse(raw); } catch (e) { return Promise.resolve(false); }
+      return open(SESSION_KEY, env).then(function (plaintext) {
+        E.Store._adopt(plaintext);
+        return true;
+      }, function () { return false; });
+    }
   };
 
   window.Epok = window.Epok || {};

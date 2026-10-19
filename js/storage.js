@@ -7,6 +7,9 @@
      · MIGRATION     every bump ships its migration in the same change
      · WRITE-THROUGH previous state kept at epok.state.prev before every overwrite
      · PERIOD STARTS their own path, because they are the model's only input
+     · EVENTS        dated spans (pregnancy, postpartum, a method, a medication) the model reads
+     · PROVENANCE    every start is "manual" or "flow"; only flow-inferred ones are ever
+                     moved or removed by the app, and a rejected inference stays rejected
      · PORTABILITY   JSON backup (encrypted if the PIN is on) + plaintext CSV
      · CUSTOM TAGS   add/remove; removal refused while a logged day carries one
 
@@ -72,8 +75,16 @@
     };
   }
 
+  // checkin (v3): the user said "I looked, nothing to log". It is what lets a
+  // day with no tags count as a day WITHOUT symptoms rather than a day with
+  // unknown ones — see insights.js correlationsSection.
+  // v4: severity is {tagId: 1..3}, self-rated, no clinical scale implied.
+  // impact is how much the day was affected. bbtMeta is {time, disturbed} for
+  // the day's temperature — a disturbed reading is kept but not used to call
+  // a rise.
   function blankDay() {
-    return { flow: null, tags: [], bbt: null, lh: null, pill: null, note: "" };
+    return { flow: null, tags: [], bbt: null, lh: null, pill: null, note: "", checkin: false,
+             severity: {}, impact: null, bbtMeta: null };
   }
 
   function blankState() {
@@ -84,7 +95,8 @@
       cycles: [],
       customTags: [],
       predictions: [],
-      meta: { lastOpened: E.calendarToday(), onboarded: false }
+      events: [],
+      meta: { lastOpened: E.calendarToday(), onboarded: false, rejectedStarts: [] }
     };
   }
 
@@ -92,7 +104,7 @@
      a year of history a few kilobytes instead of a few hundred. */
   function isEmptyDay(d) {
     if (!d) return true;
-    return d.flow == null && d.bbt == null && d.lh == null && d.pill == null &&
+    return d.flow == null && d.bbt == null && d.lh == null && d.pill == null && !d.checkin && d.impact == null &&
            !(d.note && d.note.trim()) && !(d.tags && d.tags.length);
   }
 
@@ -102,6 +114,7 @@
     var base = blankDay();
     Object.keys(base).forEach(function (k) { if (!(k in d)) d[k] = base[k]; });
     if (!Array.isArray(d.tags)) d.tags = [];
+    if (!d.severity || typeof d.severity !== "object") d.severity = {};
     return d;
   }
 
@@ -116,8 +129,14 @@
     });
     if (!state.days || typeof state.days !== "object") state.days = {};
     Object.keys(state.days).forEach(function (k) { normaliseDay(state.days[k]); });
-    ["cycles", "customTags", "predictions"].forEach(function (k) {
+    ["cycles", "customTags", "predictions", "events"].forEach(function (k) {
       if (!Array.isArray(state[k])) state[k] = [];
+    });
+    if (!state.meta || typeof state.meta !== "object") state.meta = {};
+    if (!Array.isArray(state.meta.rejectedStarts)) state.meta.rejectedStarts = [];
+    state.cycles.forEach(function (c) {
+      if (c.source !== "flow") c.source = "manual";
+      if (typeof c.excluded !== "boolean") c.excluded = false;
     });
     sortCycles(state);
     return state;
@@ -149,6 +168,48 @@
       };
       s.v = 2;
       return s;
+    },
+
+    /* v2 -> v3: where a period start came from, and a way to say "no symptoms
+       today". Every existing start becomes "manual": a v2 build could not tell
+       a start the user marked from one it inferred out of the flow log, and the
+       only safe reading is that the user owns all of them — the app only ever
+       moves or removes starts it can prove it inferred, so nothing already
+       saved can be touched by this change. Purely additive. */
+    3: function (s) {
+      (s.cycles || []).forEach(function (c) { if (c.source !== "flow") c.source = "manual"; });
+      s.meta = s.meta || {};
+      if (!Array.isArray(s.meta.rejectedStarts)) s.meta.rejectedStarts = [];
+      Object.keys(s.days || {}).forEach(function (k) {
+        if (s.days[k] && typeof s.days[k].checkin !== "boolean") s.days[k].checkin = false;
+      });
+      s.v = 3;
+      return s;
+    },
+
+    /* v3 -> v4: events, severity, temperature notes, and a way to leave a cycle
+       out of the fit. Purely additive. The one derived thing is the current
+       contraception method: it becomes an OPEN event, so the span is on record
+       the day the method is later changed (before, stopping a method erased
+       that its cycles were not natural ones). profile.contraception and
+       contraceptionStart are left exactly as they were — read, never moved —
+       so rolling back to a v3 build loses nothing. */
+    4: function (s) {
+      s.events = Array.isArray(s.events) ? s.events : [];
+      var p = s.profile || {};
+      if (p.contraception && !s.events.some(function (e) { return e.type === "contraception" && e.to == null; })) {
+        s.events.push({ id: "ev-migrated-" + p.contraception, type: "contraception", method: p.contraception,
+                        from: p.contraceptionStart || null, to: null, note: "" });
+      }
+      (s.cycles || []).forEach(function (c) { if (typeof c.excluded !== "boolean") c.excluded = false; });
+      Object.keys(s.days || {}).forEach(function (k) {
+        var d = s.days[k]; if (!d) return;
+        if (!d.severity || typeof d.severity !== "object") d.severity = {};
+        if (!("impact" in d)) d.impact = null;
+        if (!("bbtMeta" in d)) d.bbtMeta = null;
+      });
+      s.v = 4;
+      return s;
     }
   };
 
@@ -165,7 +226,7 @@
     if (!state.profile || typeof state.profile !== "object") state.profile = {};
     if (!state.days || typeof state.days !== "object") state.days = {};
     if (!state.meta || typeof state.meta !== "object") state.meta = {};
-    ["cycles", "customTags", "predictions"].forEach(function (k) {
+    ["cycles", "customTags", "predictions", "events"].forEach(function (k) {
       if (!Array.isArray(state[k])) state[k] = [];
     });
 
@@ -260,6 +321,8 @@
       // what turns every schema mistake into a recoverable one.
       if (current) localStorage.setItem(PREV_KEY, current);
       localStorage.setItem(KEY, text);
+      // Opt-in sync (js/sync.js) follows saves; with it off this is a no-op.
+      if (Store._onSaved) { try { Store._onSaved(); } catch (e2) { /* sync must never break a save */ } }
     } catch (e) {
       E.banner("storage-full",
         "epok could not save (" + (e && e.name || "error") + "). Your last changes are only in " +
@@ -271,9 +334,59 @@
     return JSON.stringify(STATE, function (k, v) { return k === "__readonly" ? undefined : v; });
   }
 
+  /* ==================================================================
+     3b. FORECAST SNAPSHOTS
+     ------------------------------------------------------------------
+     state.predictions has been in the schema since v1 and nothing wrote it, so
+     the "past predictions" the app showed were always retrospective
+     reconstructions. This writes the forecast that was actually on screen:
+     when a cycle first has one, and whenever the evidence moves it. One per
+     cycle per day (a later one the same day replaces it). When the next period
+     is logged, the snapshot is settled against what happened — signed days
+     (positive = forecast later than the real start) and inside/outside the window.
+     ================================================================== */
+
+  function snapshotForecast() {
+    var M = window.Epok && window.Epok.Model;
+    if (!M || !STATE || STATE.__readonly) return;
+    var cs = sortCycles(STATE), preds = STATE.predictions, i;
+
+    preds.forEach(function (sn) {
+      if (sn.actual != null || sn.void) return;
+      var at = -1;
+      for (i = 0; i < cs.length; i++) if (cs[i].start === sn.anchor) at = i;
+      if (at < 0) { sn.void = true; return; }                  // that start was moved or removed
+      if (cs[at + 1]) {
+        sn.actual = cs[at + 1].start;
+        sn.errorDays = E.daysBetween(sn.actual, sn.nextStart);
+        sn.inWindow = !!sn.window && sn.actual >= sn.window[0] && sn.actual <= sn.window[1];
+      }
+    });
+
+    if (!cs.length) return;
+    var o = modelOpts(); o.noMae = true;
+    var p;
+    try { p = M.predict(cs, o); } catch (e) { return; }
+    if (!p || p.refused || !p.nextStart || p.expired) return;
+
+    var anchor = cs[cs.length - 1].start, today = E.calendarToday();
+    var mine = preds.filter(function (sn) { return sn.anchor === anchor && !sn.void; });
+    var last = mine[mine.length - 1];
+    if (last && last.nextStart === p.nextStart && last.window && last.window[0] === p.window[0] &&
+        last.window[1] === p.window[1]) return;
+    var rec = {
+      madeOn: today, anchor: anchor, nextStart: p.nextStart, window: p.window, mode: p.mode, n: p.n,
+      modelVersion: M.MODEL_VERSION || 0, inputRev: cs.length + ":" + anchor + ":" + p.n,
+      actual: null, errorDays: null, inWindow: null
+    };
+    if (last && last.madeOn === today && last.actual == null) preds[preds.indexOf(last)] = rec;
+    else preds.push(rec);
+  }
+
   function writeNow() {
     if (!STATE) return;
     if (STATE.__readonly) return;
+    snapshotForecast();
     var next;
     try { next = serialise(); }
     catch (e) { E.toast("Could not serialise state."); return; }
@@ -351,8 +464,10 @@
     save();
     E.refresh();
     // Logging flow is how a period is noticed; extract its start rather than
-    // also requiring MARK PERIOD START for the same day.
-    if (patch.flow) deriveCyclesFromFlow();
+    // also requiring MARK PERIOD START for the same day. Runs on a CLEARED
+    // flow too: otherwise an inferred start outlived the only day that
+    // justified it.
+    if ("flow" in patch) deriveCyclesFromFlow();
   }
 
   /* ==================================================================
@@ -397,8 +512,11 @@
 
   var MERGE_WINDOW_DAYS = 7;
 
-  function blankCycle(start) {
-    return { start: start, end: null, length: null, ovulation: null, ovulationSource: null };
+  // source: "manual" (user marked or moved it) or "flow" (inferred from the
+  // flow log, and the only kind the app may later move or remove).
+  function blankCycle(start, source) {
+    return { start: start, end: null, length: null, ovulation: null, ovulationSource: null,
+             source: source || "manual", excluded: false };
   }
 
   /* The existing start this key would correct, or null if it is a new cycle. */
@@ -414,15 +532,28 @@
 
   /* Window B owns the model and may not have landed yet. A missing engine
      means "no prediction to show", never a thrown boot. */
+  /* The one place the model's inputs are assembled. Every view used to build
+     {conditions, ageBand, days} for itself, which is how contraception and the
+     as-of date came to be missing from all of them at once. */
+  function modelOpts() {
+    var p = get().profile, C = E.Contraception;
+    var m = p.contraception && C && C.BY_ID[p.contraception];
+    return {
+      conditions: p.conditions, ageBand: p.ageBand, days: get().days,
+      events: get().events,
+      asOf: E.today(),
+      contraception: p.contraception
+        ? { id: p.contraception, label: m ? m.label : p.contraception, start: p.contraceptionStart || null }
+        : null
+    };
+  }
+
   function predictedStart(list) {
     var M = window.Epok.Model;
     if (!M || typeof M.predict !== "function") return null;
     try {
-      var p = M.predict(list, {
-        conditions: get().profile.conditions,
-        ageBand: get().profile.ageBand,
-        days: get().days
-      });
+      var o = modelOpts(); o.noMae = true;
+      var p = M.predict(list, o);
       return (p && p.nextStart) || null;
     } catch (e) {
       if (window.console) console.warn("[epok] model refused to predict", e);
@@ -441,12 +572,13 @@
       for (var i = 0; i < next.length; i++) {
         if (next[i].start !== near.start) continue;
         next[i].start = key;
+        next[i].source = "manual";                // the user moved it; it is theirs now
         // An end before the new start is now nonsense; drop it rather than
         // keep a cycle that bleeds before it begins.
         if (next[i].end && E.daysBetween(key, next[i].end) < 0) next[i].end = null;
       }
     } else {
-      next.push(blankCycle(key));
+      next.push(blankCycle(key, "manual"));
     }
     next.sort(function (a, b) { return a.start < b.start ? -1 : a.start > b.start ? 1 : 0; });
     for (var j = 0; j < next.length; j++) {
@@ -472,67 +604,109 @@
       E.toast("Refused: " + E.prettyDate(key) + " has not happened yet.");
       return;
     }
-    var before = clone(s.cycles);
+    var before = clone(s.cycles), beforeRej = clone(s.meta.rejectedStarts);
     var near = startNear(key);
-    if (near && near.start === key) return;      // already recorded; nothing to do
+    if (near && near.start === key) {
+      // Marking an inferred start by hand adopts it: from here on the flow log
+      // can no longer move or remove it.
+      if (near.source === "flow") { near.source = "manual"; save(); E.refresh(); }
+      return;
+    }
 
     s.cycles = withStart(key);
+    s.meta.rejectedStarts = s.meta.rejectedStarts.filter(function (k) { return k !== key; });
     save();
     E.refresh();
 
     E.undo(near
       ? "Period start moved from " + E.prettyDate(near.start) + " to " + E.prettyDate(key) + "."
       : "Period start recorded on " + E.prettyDate(key) + ".",
-      function () { get().cycles = before; save(); E.refresh(); });
+      function () { get().cycles = before; get().meta.rejectedStarts = beforeRej; save(); E.refresh(); });
   }
 
   function clearPeriodStart(key) {
     var s = get();
-    var before = clone(s.cycles);
+    var before = clone(s.cycles), beforeRej = clone(s.meta.rejectedStarts);
     var kept = s.cycles.filter(function (c) { return c.start !== key; });
     if (kept.length === s.cycles.length) { E.toast("No period start on " + E.prettyDate(key) + "."); return; }
     s.cycles = kept;
+    // Removing a start the flow log would re-infer is a decision, so it is
+    // recorded; otherwise the next flow edit quietly puts it back.
+    if (flowStreakStarts(s.days).indexOf(key) >= 0 && s.meta.rejectedStarts.indexOf(key) < 0) {
+      s.meta.rejectedStarts.push(key);
+    }
     sortCycles(s);
     save();
     E.refresh();
     E.undo("Period start on " + E.prettyDate(key) + " removed.",
-      function () { get().cycles = before; save(); E.refresh(); });
+      function () { get().cycles = before; get().meta.rejectedStarts = beforeRej; save(); E.refresh(); });
   }
 
-  /* The first day of each flow streak — a gap of more than a day since the
-     last logged flow starts a new streak. That first day is a period start
-     by definition, so it does not have to be marked twice. */
+  /* The first bleeding day of each flow streak. A streak is a run of logged
+     flow days with no gap over a day; SPOTTING keeps a streak going but is
+     never what starts one, because spotting alone is not a period — one tap
+     used to mint a whole cycle, and a cycle is the model's training data. */
   function flowStreakStarts(days) {
     var keys = Object.keys(days).filter(function (k) { return days[k] && days[k].flow; }).sort();
-    var starts = [], prev = null;
+    var starts = [], prev = null, found = false;
     keys.forEach(function (k) {
-      if (!prev || E.daysBetween(prev, k) > 1) starts.push(k);
+      if (!prev || E.daysBetween(prev, k) > 1) found = false;
+      if (!found && days[k].flow !== "spotting") { starts.push(k); found = true; }
       prev = k;
     });
     return starts;
   }
 
-  /* Extracts period starts out of the flow log instead of requiring MARK
-     PERIOD START to be clicked separately. Additive only: never moves or
-     removes a start someone set or corrected by hand, and reuses the same
-     merge-window match as a manual start so a spotting day 3 days before the
-     real one still corrects rather than duplicates. One combined undo, not
-     one per day found. */
+  /* Reconciles the INFERRED starts with the flow log, in both directions.
+     Starts marked or moved by hand (source "manual") are never touched, and a
+     flow start within the merge window of one is covered by it rather than
+     duplicated. Starts the user removed (meta.rejectedStarts) are not
+     re-inferred. An inferred start whose flow day was cleared is removed, and
+     one whose streak now begins earlier (a backfilled day) moves with it —
+     before, an inferred start was permanent and never revised. One combined
+     undo. Returns the starts it created. */
   function deriveCyclesFromFlow() {
     var s = get();
     var before = clone(s.cycles);
-    var added = [];
-    flowStreakStarts(s.days).forEach(function (k) {
-      if (startNear(k)) return;
-      s.cycles = withStart(k);
-      added.push(k);
+    var rejected = s.meta.rejectedStarts || [];
+    var desired = flowStreakStarts(s.days).filter(function (k) { return rejected.indexOf(k) < 0; });
+    var next = s.cycles.filter(function (c) { return c.source !== "flow"; });
+    var old = s.cycles.filter(function (c) { return c.source === "flow"; });
+    var added = [], moved = 0;
+
+    function within(c, k) { return Math.abs(E.daysBetween(c.start, k)) <= MERGE_WINDOW_DAYS; }
+    desired.forEach(function (k) {
+      if (next.some(function (c) { return within(c, k); })) return;
+      var reuse = null;
+      old.forEach(function (c) {
+        if (!c.__taken && within(c, k) &&
+            (!reuse || Math.abs(E.daysBetween(c.start, k)) < Math.abs(E.daysBetween(reuse.start, k)))) reuse = c;
+      });
+      if (reuse) {
+        reuse.__taken = true;
+        if (reuse.start !== k) { reuse.start = k; moved++; }
+        if (reuse.end && E.daysBetween(k, reuse.end) < 0) reuse.end = null;
+        next.push(reuse);
+      } else {
+        next.push(blankCycle(k, "flow"));
+        added.push(k);
+      }
     });
-    if (!added.length) return added;
+    var removed = old.filter(function (c) { return !c.__taken; }).length;
+    old.forEach(function (c) { delete c.__taken; });
+    if (!added.length && !moved && !removed) return added;
+
+    s.cycles = next;
+    sortCycles(s);
     save();
     E.refresh();
-    E.undo(added.length === 1
-      ? "Period start extracted from your flow log: " + E.prettyDate(added[0]) + "."
-      : added.length + " period starts extracted from your flow log.",
+    var parts = [];
+    if (added.length) parts.push(added.length === 1
+      ? "period start extracted from your flow log: " + E.prettyDate(added[0])
+      : added.length + " period starts extracted from your flow log");
+    if (moved) parts.push(moved + " inferred start" + (moved === 1 ? "" : "s") + " moved to match the flow log");
+    if (removed) parts.push(removed + " inferred start" + (removed === 1 ? "" : "s") + " removed because its flow was cleared");
+    E.undo(parts.join("; ").replace(/^./, function (c) { return c.toUpperCase(); }) + ".",
       function () { get().cycles = before; save(); E.refresh(); });
     return added;
   }
@@ -641,13 +815,177 @@
     var s = get();
     var boundaryChanged = ("dayBoundaryHour" in patch) &&
                           Number(patch.dayBoundaryHour) !== Number(s.profile.dayBoundaryHour);
+    var oldMethod = s.profile.contraception, oldStart = s.profile.contraceptionStart;
     var changed = false;
     Object.keys(patch).forEach(function (k) {
       if (s.profile[k] !== patch[k]) { s.profile[k] = patch[k]; changed = true; }
     });
     if (!changed) return;
     if (boundaryChanged) E._setDayBoundary(s.profile.dayBoundaryHour);
+    syncMethodEvents(s, oldMethod, oldStart);
     save();
+  }
+
+  /* The current contraception method lives on the profile (the picker writes
+     it) AND as an open event, so that the day it changes its span is already
+     on record — stopping a method used to erase the fact that the cycles on
+     it were not natural ones. The model reads only CLOSED contraception events
+     and takes the current method from the profile, so nothing is counted twice. */
+  function syncMethodEvents(s, oldMethod, oldStart) {
+    var p = s.profile;
+    var open = s.events.filter(function (e) { return e.type === "contraception" && e.to == null; });
+    if (p.contraception !== oldMethod) {
+      var today = E.calendarToday(), closed = false;
+      open.forEach(function (e) {
+        e.to = (e.from && today < e.from) ? e.from : today; closed = true;
+      });
+      if (oldMethod && !closed) {
+        s.events.push({ id: newEventId(), type: "contraception", method: oldMethod,
+                        from: oldStart || null, to: today, note: "" });
+        closed = true;
+      }
+      if (closed) E.toast("Recorded your previous method as an event, so its cycles stay out of the fit.");
+      if (p.contraception) {
+        s.events.push({ id: newEventId(), type: "contraception", method: p.contraception,
+                        from: p.contraceptionStart || null, to: null, note: "" });
+      }
+    } else if (p.contraceptionStart !== oldStart && open.length) {
+      open[0].from = p.contraceptionStart || null;
+    }
+  }
+
+  /* ==================================================================
+     8b. EVENTS
+     ------------------------------------------------------------------
+     Dated spans the user states: pregnancy, postpartum, breastfeeding, a
+     method, a medication. The model drops cycles that overlap a pregnancy,
+     postpartum or ovulation-suppressing span from its fit, and pauses while
+     one is open. A span with no `from` is "unknown start" and covers
+     everything before its end. Nothing here gives advice.
+     ================================================================== */
+
+  var EVENT_TYPES = ["pregnancy", "postpartum", "breastfeeding", "contraception", "medication", "other"];
+
+  function newEventId() {
+    return "ev-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 6);
+  }
+
+  function addEvent(ev) {
+    var s = get();
+    if (!ev || EVENT_TYPES.indexOf(ev.type) < 0) return { ok: false, error: "Pick what kind of event this is." };
+    if (ev.from && !E.isKey(ev.from)) return { ok: false, error: "The start is not a date." };
+    if (ev.to && !E.isKey(ev.to)) return { ok: false, error: "The end is not a date." };
+    if (ev.from && ev.to && ev.to < ev.from) return { ok: false, error: "The end is before the start." };
+    if (ev.type === "contraception" && !(window.Epok.Contraception && window.Epok.Contraception.BY_ID[ev.method])) {
+      return { ok: false, error: "Pick which method." };
+    }
+    var rec = { id: newEventId(), type: ev.type, method: ev.type === "contraception" ? ev.method : null,
+                from: ev.from || null, to: ev.to || null, note: String(ev.note || "").slice(0, 120) };
+    var before = clone(s.events);
+    s.events.push(rec);
+    save(); E.refresh();
+    E.undo("Event added.", function () { get().events = before; save(); E.refresh(); });
+    return { ok: true, error: null, id: rec.id };
+  }
+
+  function endEvent(id, to) {
+    var s = get(), ev = s.events.filter(function (e) { return e.id === id; })[0];
+    if (!ev) return { ok: false, error: "No such event." };
+    if (!E.isKey(to) || (ev.from && to < ev.from)) return { ok: false, error: "That end date is before the start." };
+    var before = clone(s.events);
+    ev.to = to;
+    save(); E.refresh();
+    E.undo("Event ended.", function () { get().events = before; save(); E.refresh(); });
+    return { ok: true, error: null };
+  }
+
+  function removeEvent(id) {
+    var s = get(), before = clone(s.events);
+    var kept = s.events.filter(function (e) { return e.id !== id; });
+    if (kept.length === s.events.length) return { ok: false, error: "No such event." };
+    s.events = kept;
+    save(); E.refresh();
+    E.undo("Event removed.", function () { get().events = before; save(); E.refresh(); });
+    return { ok: true, error: null };
+  }
+
+  /* ==================================================================
+     8a. REMOTE RECORDS (opt-in sync)
+     ------------------------------------------------------------------
+     js/sync.js hands changed records here by logical key. Written through the
+     normal normalisers, so a record from another device or an older build can
+     never put a malformed shape into state. Saving goes through save(), which
+     writes epok.state.prev first — the state this overwrites stays recoverable.
+     ================================================================== */
+
+  function applyRemote(changes) {
+    var s = get();
+    changes.forEach(function (c) {
+      var k = c.k, v = c.v;
+      if (k.indexOf("day:") === 0) {
+        var key = k.slice(4);
+        if (!E.isKey(key)) return;
+        if (v == null) { delete s.days[key]; return; }
+        var d = normaliseDay(clone(v));
+        if (isEmptyDay(d)) delete s.days[key]; else s.days[key] = d;
+      } else if (k === "blob:cycles") {
+        s.cycles = Array.isArray(v) ? clone(v) : [];
+        s.cycles.forEach(function (cy) {
+          if (cy.source !== "flow") cy.source = "manual";
+          if (typeof cy.excluded !== "boolean") cy.excluded = false;
+        });
+        sortCycles(s);
+      } else if (k === "blob:events") { s.events = Array.isArray(v) ? clone(v) : []; }
+      else if (k === "blob:customTags") { s.customTags = Array.isArray(v) ? clone(v) : []; }
+      else if (k === "blob:predictions") { s.predictions = Array.isArray(v) ? clone(v) : []; }
+      else if (k === "blob:rejected") { s.meta.rejectedStarts = Array.isArray(v) ? v.slice() : []; }
+      else if (k === "blob:profile" && v && typeof v === "object") {
+        Object.keys(v).forEach(function (f) { s.profile[f] = v[f]; });
+      }
+    });
+    save();
+    E.refresh();
+  }
+
+  /* ==================================================================
+     8c. CYCLE REVIEW
+     ================================================================== */
+
+  /* Leave a cycle out of the fit without deleting it. Its length is still
+     shown everywhere; the model just does not learn from it. */
+  function setCycleExcluded(start, flag) {
+    var s = get(), c = s.cycles.filter(function (x) { return x.start === start; })[0];
+    if (!c) return { ok: false, error: "No cycle starts on " + start + "." };
+    var before = clone(s.cycles);
+    c.excluded = !!flag;
+    save(); E.refresh();
+    E.undo(flag ? "Cycle left out of the fit." : "Cycle counted in the fit again.",
+      function () { get().cycles = before; save(); E.refresh(); });
+    return { ok: true, error: null };
+  }
+
+  /* Move a start to any date, not only within the merge window. Refuses a
+     date that would land on or within the merge window of ANOTHER start —
+     that is a merge, and merging is its own action. A moved start is the
+     user's, so it becomes "manual". */
+  function moveStart(from, to) {
+    var s = get();
+    if (!E.isKey(to)) return { ok: false, error: "That is not a date." };
+    if (E.daysBetween(to, E.today()) < 0) return { ok: false, error: "That date has not happened yet." };
+    var c = s.cycles.filter(function (x) { return x.start === from; })[0];
+    if (!c) return { ok: false, error: "No cycle starts on " + from + "." };
+    var clash = s.cycles.some(function (x) {
+      return x !== c && Math.abs(E.daysBetween(x.start, to)) <= MERGE_WINDOW_DAYS;
+    });
+    if (clash) return { ok: false, error: "That is within " + MERGE_WINDOW_DAYS +
+      " days of another start. To combine two cycles, remove one start instead." };
+    var before = clone(s.cycles);
+    c.start = to; c.source = "manual";
+    if (c.end && E.daysBetween(to, c.end) < 0) c.end = null;
+    sortCycles(s);
+    save(); E.refresh();
+    E.undo("Period start moved to " + E.prettyDate(to) + ".", function () { get().cycles = before; save(); E.refresh(); });
+    return { ok: true, error: null };
   }
 
   /* ==================================================================
@@ -744,7 +1082,15 @@
     setPeriodStart: setPeriodStart,
     clearPeriodStart: clearPeriodStart,
     deriveCyclesFromFlow: deriveCyclesFromFlow,
+    modelOpts: modelOpts,
     setProfile: setProfile,
+    EVENT_TYPES: EVENT_TYPES,
+    addEvent: addEvent, endEvent: endEvent, removeEvent: removeEvent,
+    setCycleExcluded: setCycleExcluded, moveStart: moveStart,
+
+    // Opt-in sync hooks. _onSaved is set by Epok.Sync only while sync is on.
+    _onSaved: null,
+    _applyRemote: applyRemote,
     MAX_TAG_LABEL: MAX_TAG_LABEL,
     addCustomTag: addCustomTag,
     removeCustomTag: removeCustomTag,
@@ -755,6 +1101,39 @@
     exportCSV: exportCSV,
     importJSON: importJSON
   };
+
+  /* Another tab saved: adopt its copy. Without this, this tab's next save
+     writes its stale log over a day the other tab just logged — measured:
+     HEAVY tapped in one tab, a symptom in the other, and the flow was gone
+     from epok.state.v1 (only epok.state.prev still held it, one save deep).
+     Sealed data needs the key, so Epok.Lock opens it; a locked tab has
+     nothing to save and ignores the event.
+     ponytail: an edit made here inside the 200 ms save debounce can still
+     lose the race to the other tab. */
+  window.addEventListener("storage", function (e) {
+    if (e.key !== KEY || e.newValue == null || !STATE || STATE.__readonly) return;
+    var adopted = isSealed(e.newValue)
+      ? (E.Lock && E.Lock.adoptSealed ? E.Lock.adoptSealed(e.newValue) : Promise.resolve(false))
+          .then(function (ok) {
+            /* Sealed by a PIN this tab doesn't hold (switched on, or changed,
+               elsewhere). A save from here would write the log back in
+               plaintext, or under the old PIN — measured: the PIN switched on
+               in one tab, a symptom logged in the other, and the stored log
+               was plaintext again. So this tab stops writing. */
+            if (!ok) {
+              STATE.__readonly = true;
+              E.banner("locked",
+                "epok was locked in another tab. Nothing here will be saved: reload and enter your PIN.",
+                { tone: "danger" });
+            }
+            return ok;
+          })
+      : new Promise(function (done) {
+          try { STATE = tryParse(e.newValue); applyProfile(); done(true); }
+          catch (err) { done(false); }
+        });
+    adopted.then(function (ok) { if (ok && E.refresh) E.refresh(); });
+  });
 
   window.Epok = window.Epok || {};
   window.Epok.Store = Store;

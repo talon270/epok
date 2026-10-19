@@ -8,6 +8,10 @@
      · CHANGE-POINT  a superseded regime is dropped from the fit, and the card says so
      · LUTEAL        confirmed ovulation switches to ovulation + measured luteal length
      · HISTORY       per finished cycle: ovulation (confirmed or estimated) and its fertile bands
+     · AS-OF         every forecast sees only observations up to opts.asOf, so a backtest cannot read the future
+     · PAUSED        no natural-cycle forecast while an ovulation-suppressing method, a pregnancy or
+                     a postpartum span is in effect
+     · SPANS         cycles that overlap such a span, or that the user left out, are not fitted
      · PURE          no DOM, no localStorage. Everything arrives as arguments.
 
    Public namespace: Epok.Model
@@ -26,6 +30,9 @@
     pcos:          { mean: 36.5, sd: 9.0, source: "pcos" },
     perimenopause: { mean: 33.0, sd: 11.0, source: "perimenopause" }
   };
+  // Written on every saved forecast (state.predictions) so a snapshot says
+  // which engine made it. Bump it when a change can move a forecast.
+  var MODEL_VERSION = 2;
   var MIN_CYCLES_TO_PREDICT = 3;   // below this the model refuses and says why
   var REGIME_WINDOW = 3;           // cycles compared against the prior regime
 
@@ -54,6 +61,10 @@
   // Telling someone with PCOS that their cycles have "changed" when they are
   // merely being irregular is the PLAN A5 failure in another costume.
   var REGIME_SIGMAS_IRREGULAR = 3.5;
+
+  // Extra sigmas a boundary must clear once more than REGIME_WINDOW cycles
+  // sit after it. See detectRegime.
+  var REGIME_MATURE_EXTRA = 1.0;
 
   // Spread is POOLED toward a typical within-person figure rather than floored.
   // A floor lets three near-identical cycles claim near-certainty, and one
@@ -91,6 +102,36 @@
   // 3-over-6: three consecutive temperatures above the highest of the previous
   // six, the third at least this far above. The standard symptothermal rule.
   var BBT_RISE_C = 0.2;
+  // Compared as integer hundredths: 36.8 - 36.6 is 0.19999999999999574 in
+  // floating point and failed a threshold the chart exactly meets.
+  var BBT_RISE_HUNDREDTHS = Math.round(BBT_RISE_C * 100);
+
+  // LH and temperature are two different, indirect signals. They are called
+  // "both" only when their dates fall within this many days of each other;
+  // further apart they are a conflict, never averaged into a date neither
+  // signal reported. UNSOURCED — an engineering tolerance, not a clinical one.
+  var OV_AGREE_DAYS = 3;
+
+  // How far a single-signal ovulation date is trusted, as a spread around it.
+  // An LH surge precedes ovulation by roughly 1-2 days and a strip can be a
+  // false positive (ASRM); a temperature rise only shows ovulation after the
+  // fact and is noisier still. "both" and a user-recorded date stay exact.
+  // The shapes are UNSOURCED and deliberately wide.
+  var OV_SPREAD = {
+    lh:  { "-1": 0.25, "0": 0.50, "1": 0.25 },
+    bbt: { "-2": 0.10, "-1": 0.20, "0": 0.40, "1": 0.20, "2": 0.10 }
+  };
+
+  // Methods that suppress ovulation, so bleeding on them is a pack or
+  // withdrawal bleed and not the cycle this model fits (CDC US SPR for
+  // combined hormonal methods; injection, implant, ring and patch likewise).
+  // The progestogen-only pill and IUDs are NOT listed: pill suppression is
+  // inconsistent, and the data table does not separate hormonal from copper
+  // IUDs — pausing on a copper IUD would be wrong.
+  var OV_SUPPRESSING = {
+    "combined-21-7": true, "combined-24-4": true, "continuous": true,
+    "patch": true, "ring": true, "injection": true, "implant": true
+  };
   var BBT_LOOKBACK = 6;
 
   // Central credible interval reported as the window. 80% is chosen over 95%
@@ -198,25 +239,47 @@
   }
 
   /**
-   * Change-point detection. Compares the last REGIME_WINDOW lengths against
-   * everything before them; if they differ on both tests, the older block is
-   * superseded and dropped from the fit.
+   * Change-point detection. Compares the last REGIME_WINDOW lengths against the
+   * rest of the current segment; if they differ on both tests, the older block
+   * is superseded.
+   *
+   * Replayed chronologically rather than re-run on the whole record: a fresh
+   * test on every call let the boundary slide one cycle forward with each new
+   * observation, and once the record was twice the window the detector stopped
+   * firing and every dropped cycle came back (eight 28s then 34s: the fit fell
+   * from 34 to 32 on another identical 34). Once a boundary is set, the cycles
+   * after it are one segment and are only compared against each other.
    */
-  function detectRegime(lengths, sigmas) {
-    var none = { changed: false, index: 0, dropped: 0 };
-    if (lengths.length < REGIME_WINDOW * 2) return none;
-
-    var cut = lengths.length - REGIME_WINDOW;
-    var prior = lengths.slice(0, cut);
-    var recent = lengths.slice(cut);
+  function regimeFires(prior, recent, sigmas) {
     var dm = Math.abs(mean(recent) - mean(prior));
     var sp = pooledSd(prior, WITHIN_SD_CYCLE), sr = pooledSd(recent, WITHIN_SD_CYCLE);
     var se = Math.sqrt(sp * sp / prior.length + sr * sr / recent.length);
+    return dm >= sigmas * se && dm >= REGIME_MIN_DAYS;
+  }
 
-    if (dm >= sigmas * se && dm >= REGIME_MIN_DAYS) {
-      return { changed: true, index: cut, dropped: cut };
+  function detectRegime(lengths, sigmas) {
+    var bounds = [0];                       // segment starts; bounds[0] is the record's start
+    for (var n = REGIME_WINDOW * 2; n <= lengths.length; n++) {
+      var from = bounds[bounds.length - 1];
+      if (n - from < REGIME_WINDOW * 2) continue;
+      var cut = n - REGIME_WINDOW;
+      if (regimeFires(lengths.slice(from, cut), lengths.slice(cut, n), sigmas)) bounds.push(cut);
     }
-    return none;
+    // A boundary is kept only if the WHOLE segment after it still differs from
+    // the one before it. A single noisy run that fired and then regressed to
+    // the old mean is dropped here; without this, one false fire stuck for the
+    // rest of the record and the PCOS cohort's false-fire rate went 2.3% -> 16%.
+    while (bounds.length > 1) {
+      var b = bounds[bounds.length - 1], pb = bounds[bounds.length - 2];
+      // A boundary with more than REGIME_WINDOW cycles behind it has had time to
+      // prove itself, so it is held to a stricter bar than a fresh one.
+      var bar = lengths.length - b > REGIME_WINDOW ? sigmas + REGIME_MATURE_EXTRA : sigmas;
+      if (regimeFires(lengths.slice(pb, b), lengths.slice(b), bar)) break;
+      bounds.pop();
+    }
+    var boundary = bounds[bounds.length - 1];
+    return boundary > 0 ? { changed: true, index: boundary, dropped: boundary }
+                        : { changed: false, index: 0, dropped: 0 };
   }
 
   // ── cycle helpers ───────────────────────────────────────────────────────
@@ -226,9 +289,45 @@
   function closedCycles(cycles) {
     var out = [];
     for (var i = 0; i < cycles.length; i++) {
-      if (typeof cycles[i].length === "number") out.push(cycles[i]);
+      if (typeof cycles[i].length === "number" && !cycles[i]._skip && !cycles[i].excluded) out.push(cycles[i]);
     }
     return out;
+  }
+
+  /**
+   * Spans, from events, in which a cycle is not a natural one: pregnancy,
+   * postpartum, and a closed spell on an ovulation-suppressing method. An
+   * open contraception event is the CURRENT method and is read from
+   * opts.contraception instead, so it is not counted twice. A span with no
+   * start covers everything before its end.
+   */
+  function skipSpans(events) {
+    var out = [];
+    (events || []).forEach(function (e) {
+      var natural = e.type === "pregnancy" || e.type === "postpartum" ||
+        (e.type === "contraception" && e.to && OV_SUPPRESSING[e.method]);
+      if (natural) out.push({ from: e.from || "0000-01-01", to: e.to || "9999-12-31" });
+    });
+    return out;
+  }
+
+  /** Copies of closed cycles, marked _skip when they overlap a span. The open cycle is never marked. */
+  function flagCycles(cycles, events) {
+    var spans = skipSpans(events);
+    return cycles.map(function (c, i) {
+      var next = cycles[i + 1];
+      var skip = false;
+      if (next && spans.length) {
+        var last = addDays(next.start, -1);
+        for (var j = 0; j < spans.length; j++) {
+          if (c.start <= spans[j].to && last >= spans[j].from) { skip = true; break; }
+        }
+      }
+      var copy = {};
+      for (var k in c) if (Object.prototype.hasOwnProperty.call(c, k)) copy[k] = c[k];
+      copy._skip = skip;
+      return copy;
+    });
   }
 
   function anchorOf(cycles) {
@@ -276,6 +375,18 @@
 
   // ── ovulation ───────────────────────────────────────────────────────────
   /**
+   * A day's temperature as the detector may use it. A reading the user marked
+   * disturbed (illness, alcohol, poor sleep…) is kept in the log and left out
+   * here — treated as missing, so a baseline with too few clean readings
+   * returns no rise rather than a guess.
+   */
+  function bbtOf(d) {
+    if (!d || typeof d.bbt !== "number") return null;
+    if (d.bbtMeta && d.bbtMeta.disturbed) return null;
+    return d.bbt;
+  }
+
+  /**
    * detectOvulation(days, cycleStart, cycleEnd)
    * Scans the inclusive date range [cycleStart, cycleEnd] — that is the whole
    * cycle window, not the bleeding days. Returns null when neither rule fires.
@@ -288,8 +399,9 @@
     var keys = [], i;
     for (i = 0; i <= span; i++) keys.push(addDays(cycleStart, i));
 
-    // LH: the surge precedes ovulation by roughly a day. The first positive is
-    // taken; a later one in the same cycle is the same surge read twice.
+    // LH: the surge precedes ovulation by roughly a day. The FIRST positive in
+    // the window is taken — a cycle with two separate surges is not resolved
+    // here, and the date it returns is a single strip's reading, not a fact.
     var lhDate = null;
     for (i = 0; i < keys.length; i++) {
       var d = days[keys[i]];
@@ -302,7 +414,7 @@
       var back = [], j, dj;
       for (j = i - BBT_LOOKBACK; j < i; j++) {
         dj = days[keys[j]];
-        if (dj && typeof dj.bbt === "number") back.push(dj.bbt);
+        if (bbtOf(dj) !== null) back.push(bbtOf(dj));
       }
       if (back.length < 4) continue;          // too sparse a baseline to call a rise
       var base = Math.max.apply(null, back);
@@ -310,18 +422,27 @@
       var highs = [], ok = true;
       for (j = i; j < i + 3; j++) {
         dj = days[keys[j]];
-        if (!dj || typeof dj.bbt !== "number" || dj.bbt <= base) { ok = false; break; }
-        highs.push(dj.bbt);
+        var bj = bbtOf(dj);
+        if (bj === null || bj <= base) { ok = false; break; }
+        highs.push(bj);
       }
       if (!ok) continue;
-      if (highs[2] - base < BBT_RISE_C) continue;
+      if (Math.round(highs[2] * 100) - Math.round(base * 100) < BBT_RISE_HUNDREDTHS) continue;
       bbtDate = addDays(keys[i], -1);
       break;
     }
 
-    if (lhDate && bbtDate) return { date: lhDate, source: "both", rule: "lh-positive" };
-    if (lhDate) return { date: lhDate, source: "lh", rule: "lh-positive" };
-    if (bbtDate) return { date: bbtDate, source: "bbt", rule: "3-over-6" };
+    // The two signals are kept apart. "both" needs them within OV_AGREE_DAYS;
+    // otherwise the result is a conflict with NO date, because any single date
+    // picked from two that disagree would be one neither signal reported.
+    if (lhDate && bbtDate) {
+      if (Math.abs(diffDays(lhDate, bbtDate)) <= OV_AGREE_DAYS) {
+        return { date: lhDate, source: "both", rule: "lh-positive", lh: lhDate, bbt: bbtDate };
+      }
+      return { date: null, source: "conflict", rule: "disagree", lh: lhDate, bbt: bbtDate };
+    }
+    if (lhDate) return { date: lhDate, source: "lh", rule: "lh-positive", lh: lhDate, bbt: null };
+    if (bbtDate) return { date: bbtDate, source: "bbt", rule: "3-over-6", lh: null, bbt: bbtDate };
     return null;
   }
 
@@ -330,7 +451,7 @@
     var obs = [];
     for (var i = 0; i < cycles.length; i++) {
       var c = cycles[i];
-      if (!c.ovulation || typeof c.length !== "number") continue;
+      if (!c.ovulation || typeof c.length !== "number" || c._skip || c.excluded) continue;
       var luteal = c.length - diffDays(c.start, c.ovulation);
       if (luteal >= LUTEAL_PLAUSIBLE[0] && luteal <= LUTEAL_PLAUSIBLE[1]) obs.push(luteal);
     }
@@ -338,7 +459,18 @@
     return { mean: mean(obs), sd: pooledSd(obs, WITHIN_SD_LUTEAL), n: obs.length };
   }
 
-  /** The open cycle's ovulation: recorded if present, detected from days if not. */
+  function latestKey(days) {
+    var best = null;
+    for (var k in days) if (Object.prototype.hasOwnProperty.call(days, k) && (best === null || k > best)) best = k;
+    return best;
+  }
+
+  /**
+   * The open cycle's ovulation: recorded if present, detected from days if not.
+   * Detection reads only observations up to opts.asOf (else the newest logged
+   * day) — never a fixed horizon, which both missed a late surge in a long
+   * cycle and let a backtest read the cycle that came after.
+   */
   function currentOvulation(cycles, opts) {
     if (!cycles.length) return null;
     var cur = cycles[cycles.length - 1];
@@ -347,9 +479,86 @@
     }
     var days = opts && opts.days;
     if (!days) return null;
-    // Scan from this start up to a generous horizon; the cycle is still open,
-    // so there is no next start to bound it with.
-    return detectOvulation(days, cur.start, addDays(cur.start, 45));
+    var end = (opts && opts.asOf) || latestKey(days);
+    if (!end || end < cur.start) return null;
+    return detectOvulation(days, cur.start, end);
+  }
+
+  /**
+   * Closed cycles that carry no recorded ovulation get one derived from their
+   * own BBT/LH, bounded by the next start. Without this the luteal predictor
+   * only ever ran on data pre-filled by a test generator: ordinary app logs
+   * never write cycle.ovulation, so luteal mode activated in 0 of 1,200 fully
+   * charted histories.
+   */
+  function withOvulation(cycles, days) {
+    if (!days) return cycles;
+    return cycles.map(function (c, i) {
+      var next = cycles[i + 1];
+      if (c.ovulation || !next || typeof c.length !== "number") return c;
+      var det = detectOvulation(days, c.start, addDays(next.start, -1));
+      if (!det || !det.date) return c;
+      var copy = {};
+      for (var k in c) if (Object.prototype.hasOwnProperty.call(c, k)) copy[k] = c[k];
+      copy.ovulation = det.date;
+      copy.ovulationSource = det.source;
+      return copy;
+    });
+  }
+
+  /** Distribution over the ovulation date implied by one piece of evidence. */
+  function ovulationDist(ev) {
+    var spread = ev.rule === "recorded" ? null : OV_SPREAD[ev.source];
+    if (!spread) return [{ date: ev.date, p: 1 }];
+    var out = [];
+    for (var off in spread) {
+      if (Object.prototype.hasOwnProperty.call(spread, off)) out.push({ date: addDays(ev.date, parseInt(off, 10)), p: spread[off] });
+    }
+    return out;
+  }
+  /** Exact only when two signals agree or the user recorded it; one signal is a spread. */
+  function isConfirmed(ev) { return !!ev && (ev.rule === "recorded" || !OV_SPREAD[ev.source]); }
+
+  var SOURCE_WORDS = { both: "temperature and LH", lh: "an LH test", bbt: "the temperature rise" };
+
+  /**
+   * What pauses natural-cycle prediction right now, or null. Three causes:
+   * an ovulation-suppressing method (from its start date; with no start date
+   * it is paused outright, because the alternative is forecasting a pack
+   * bleed), an open pregnancy, or an open postpartum span.
+   */
+  function pausedBy(opts) {
+    var c = opts && opts.contraception;
+    if (c && OV_SUPPRESSING[c.id] && !(c.start && opts.asOf && c.start > opts.asOf)) {
+      return { kind: "contraception", label: c.label || c.id, start: c.start };
+    }
+    var events = (opts && opts.events) || [];
+    for (var i = 0; i < events.length; i++) {
+      var e = events[i];
+      if (e.type !== "pregnancy" && e.type !== "postpartum") continue;
+      var asOf = opts.asOf || "9999-12-31";
+      // `to` is the last day of the span for the FIT (cycles overlapping it are
+      // left out), but a span ended today stops pausing today.
+      if ((e.from || "0000-01-01") <= asOf && (!e.to || e.to > asOf)) return { kind: "event", type: e.type };
+    }
+    return null;
+  }
+  function pausedReason(c) {
+    if (c.kind === "event") {
+      return "A " + c.type + " span is open in your events, so natural-cycle predictions are paused — " +
+        "the cycle this model fits is not the one happening. They resume when the span is ended.";
+    }
+    return c.label + " is in use, and it suppresses ovulation — so the bleeding on it is a " +
+      "scheduled or withdrawal bleed, not the cycle this model fits. Natural-cycle predictions are paused " +
+      "rather than showing a date that means something else. They resume when the method in Settings is " +
+      "set to NONE." + (c.start ? "" : " (No start date is set, so every logged cycle is treated as affected.)");
+  }
+  /** Breastfeeding does not pause anything; it widens how much to trust the date. */
+  function breastfeeding(opts) {
+    var events = (opts && opts.events) || [], asOf = (opts && opts.asOf) || "9999-12-31";
+    return events.some(function (e) {
+      return e.type === "breastfeeding" && (e.from || "0000-01-01") <= asOf && (!e.to || e.to > asOf);
+    });
   }
 
   // ── prediction ──────────────────────────────────────────────────────────
@@ -357,7 +566,10 @@
 
   /**
    * predict(cycles, opts) -> Prediction (shape frozen in CONTRACTS.md)
-   * opts: { conditions: [], ageBand, days, noMae, noRegime }
+   * opts: { conditions: [], ageBand, days, asOf, contraception, noMae, noRegime }
+   * `asOf` is the date the forecast is made on: nothing logged after it is read.
+   * Omit it and the newest logged day stands in. `contraception` is
+   * { id, label, start } of the current method, or absent.
    * `noMae` is internal — it stops the leave-one-out pass recursing.
    * `noRegime` is internal — tools/score.js uses it to score the engine with
    * change-point detection switched off, which is the only way to show the
@@ -365,7 +577,7 @@
    */
   function predict(cycles, opts) {
     opts = opts || {};
-    cycles = cycles || [];
+    cycles = flagCycles(cycles || [], opts.events);
 
     var prior = priorFor(opts);
     var closed = closedCycles(cycles);
@@ -382,8 +594,19 @@
       prior: { mean: prior.mean, sd: prior.sd, source: prior.source },
       regime: { changed: false, since: null, dropped: 0 },
       mae: null,
+      asOf: opts.asOf || null,
+      expired: false,
+      paused: null,
       reason: ""
     };
+
+    var pause = pausedBy(opts);
+    if (pause) {
+      out.refused = true;
+      out.paused = pause.kind;
+      out.reason = pausedReason(pause);
+      return out;
+    }
 
     if (!anchor) {
       out.refused = true;
@@ -393,7 +616,9 @@
 
     if (lengths.length < MIN_CYCLES_TO_PREDICT) {
       out.refused = true;
-      out.reason = "Only " + plural(lengths.length, "complete cycle") + " logged. " +
+      var left = cycles.filter(function (c) { return typeof c.length === "number" && (c._skip || c.excluded); }).length;
+      out.reason = "Only " + plural(lengths.length, "complete cycle") + " usable" +
+        (left ? " (" + plural(left, "other") + " left out — excluded by you, or inside a pregnancy, postpartum or method span)" : " logged") + ". " +
         "The model needs " + MIN_CYCLES_TO_PREDICT +
         " before it will name a date, because below that it would be repeating the population average back to you.";
       return out;
@@ -419,7 +644,8 @@
     // measured luteal length beats a cycle-length fit, because the follicular
     // phase carries nearly all the variance.
     var ov = currentOvulation(cycles, opts);
-    var lut = lutealStats(cycles);
+    if (ov && !ov.date) ov = null;                  // a conflict is not evidence of a date
+    var lut = lutealStats(withOvulation(cycles, opts.days));
     var lpost = (ov && lut) ? posteriorFromStats(lut, LUTEAL_PRIOR) : null;
 
     // Luteal mode is offered, not assumed. It wins only when it produces the
@@ -434,8 +660,8 @@
       out.curve = buildCurve(ov.date, lpost.mean, lpost.predSd);
       out.nextStart = modeDate(out.curve);
       out.window = windowFrom(out.curve);
-      out.reason = "Luteal mode: ovulation confirmed " + ov.date + " by " +
-        (ov.source === "both" ? "temperature and LH" : ov.source === "lh" ? "an LH test" : "the temperature rise") +
+      out.reason = "Luteal mode: ovulation detected " + ov.date + " by " +
+        (SOURCE_WORDS[ov.source] || "your log") +
         ", plus your own luteal length of " + lpost.mean.toFixed(1) + " days from " +
         plural(lut.n, "cycle") + ". That is a tighter fit than your cycle length alone gives (" +
         lpost.predSd.toFixed(1) + " days of spread against " + post.predSd.toFixed(1) + ").";
@@ -452,10 +678,25 @@
             " that those are no longer used."
           : ".") +
         (lpost
-          ? " Ovulation is confirmed this cycle, but your luteal length varies more than your cycle length does (" +
+          ? " Ovulation is detected this cycle, but your luteal length varies more than your cycle length does (" +
             lpost.predSd.toFixed(1) + " days of spread against " + post.predSd.toFixed(1) +
             "), so the cycle-length fit is used instead."
           : "");
+    }
+
+    // An earlier forecast stays on the record but stops being a forecast once
+    // its window is behind us. Nothing here assumes bleeding has not started —
+    // an empty log does not prove that — so the curve is not re-conditioned
+    // into a fresh precise date.
+    if (breastfeeding(opts)) {
+      out.reason += " Breastfeeding is on record, and cycle timing can run longer or less regularly while it lasts — " +
+        "treat the window as less certain than it prints.";
+    }
+    if (opts.asOf && out.window && opts.asOf > out.window[1]) {
+      out.expired = true;
+      out.reason = "This forecast has expired: its window ended " + plural(diffDays(out.window[1], opts.asOf), "day") +
+        " ago and no period start is logged since. If bleeding has started, log it; if it has not, this is a longer " +
+        "cycle than the fit allowed for, and the model has no credible new date to offer. " + out.reason;
     }
 
     if (!opts.noMae) {
@@ -480,8 +721,12 @@
    */
   function loo(cycles, opts) {
     opts = opts || {};
+    cycles = flagCycles(cycles, opts.events);
     var rows = [];
     for (var i = MIN_CYCLES_TO_PREDICT; i < cycles.length - 1; i++) {
+      // A cycle the user left out, or one inside a span, is not an outcome the
+      // model is being asked to predict.
+      if (cycles[i]._skip || cycles[i].excluded) continue;
       // Everything up to and including cycle i, with cycle i reopened — this
       // is exactly the state the app holds the moment before the next period.
       var subset = cycles.slice(0, i + 1);
@@ -490,17 +735,23 @@
         start: open.start, end: open.end, length: null,
         ovulation: null, ovulationSource: null
       };
+      var actual = cycles[i + 1].start;
+      // The forecast is made the day before the period arrives, so it may read
+      // anything logged up to then and nothing after. Without this bound an LH
+      // result dated inside the NEXT cycle changed an earlier forecast from
+      // 25 Apr to 18 May.
       var p = predict(subset, {
         conditions: opts.conditions, ageBand: opts.ageBand, days: opts.days,
+        asOf: addDays(actual, -1), contraception: opts.contraception, events: opts.events,
         noMae: true, noRegime: opts.noRegime
       });
-      if (!p.nextStart) continue;
-      var actual = cycles[i + 1].start;
+      if (!p.nextStart || p.paused) continue;
       rows.push({
         start: open.start,
         predicted: p.nextStart,
         actual: actual,
         errorDays: diffDays(actual, p.nextStart),
+        window: p.window,
         mode: p.mode
       });
     }
@@ -544,18 +795,20 @@
    */
   function history(cycles, opts) {
     var days = (opts && opts.days) || {};
-    var found = [], i;
+    cycles = flagCycles(cycles, opts && opts.events);
+    var found = [], conflicts = {}, i;
     for (i = 0; i < cycles.length; i++) {
       var c = cycles[i], next = cycles[i + 1];
       if (!next || typeof c.length !== "number") { found.push(null); continue; }
-      if (c.ovulation) { found.push({ date: c.ovulation, source: c.ovulationSource || "recorded" }); continue; }
+      if (c.ovulation) { found.push({ date: c.ovulation, source: c.ovulationSource || "recorded", rule: "recorded" }); continue; }
       var det = detectOvulation(days, c.start, addDays(next.start, -1));
-      found.push(det ? { date: det.date, source: det.source } : null);
+      if (det && !det.date) { conflicts[i] = { lh: det.lh, bbt: det.bbt }; det = null; }
+      found.push(det ? { date: det.date, source: det.source, rule: det.rule } : null);
     }
 
     // Charted cycles measure the luteal phase for the uncharted ones.
     var measured = cycles.map(function (c, j) {
-      return found[j] ? { start: c.start, length: c.length, ovulation: found[j].date } : { start: c.start, length: c.length };
+      return found[j] ? { start: c.start, length: c.length, ovulation: found[j].date, _skip: c._skip, excluded: c.excluded } : { start: c.start, length: c.length, _skip: c._skip, excluded: c.excluded };
     });
     var lut = lutealStats(measured);
     var luteal = lut ? posteriorFromStats(lut, LUTEAL_PRIOR) : { mean: LUTEAL_PRIOR.mean, predSd: LUTEAL_PRIOR.sd };
@@ -565,13 +818,14 @@
       var cur = cycles[i], nxt = cycles[i + 1];
       if (typeof cur.length !== "number") continue;
       var end = addDays(nxt.start, -1);
-      var confirmed = !!found[i];
-      var ovDate = confirmed ? found[i].date : addDays(nxt.start, -Math.round(luteal.mean));
+      var detected = !!found[i];
+      var confirmed = detected && isConfirmed(found[i]);
+      var ovDate = detected ? found[i].date : addDays(nxt.start, -Math.round(luteal.mean));
       // A cycle too short to hold its own estimated ovulation gets no guess.
       if (diffDays(cur.start, ovDate) < 1 || diffDays(ovDate, end) < 0) continue;
 
       var dist;
-      if (confirmed) dist = [{ date: ovDate, p: 1 }];
+      if (detected) dist = ovulationDist(found[i]);
       else {
         dist = []; var total = 0, o;
         for (o = -3; o <= 3; o++) {
@@ -582,7 +836,8 @@
       }
       out.push({
         start: cur.start, end: end, confirmed: confirmed,
-        ovulation: { date: ovDate, source: confirmed ? found[i].source : "estimated" },
+        ovulation: { date: ovDate, source: detected ? found[i].source : "estimated" },
+        conflict: conflicts[i] || null,
         bands: bandsOver(dist, cur.start, end)
       });
     }
@@ -604,21 +859,29 @@
     // words outright so a later edit cannot quietly reintroduce the assertion.
     var never = "This is an estimate, not contraception. Calendar-based estimates fail for about 1 in 4 people who rely on them in a year. A low band is not a zero, on any day of your cycle.";
 
-    var p = predict(cycles, { conditions: opts.conditions, ageBand: opts.ageBand, days: opts.days, noMae: true });
+    var pause = pausedBy(opts);
+    if (pause) {
+      return { bands: [], ovulation: null, confirmed: false, paused: pause.kind,
+        reason: pausedReason(pause) + " " + never };
+    }
+    var p = predict(cycles, { conditions: opts.conditions, ageBand: opts.ageBand, days: opts.days,
+      asOf: opts.asOf, contraception: opts.contraception, events: opts.events, noMae: true });
     if (!cycles.length || p.refused) {
       return { bands: [], ovulation: null, confirmed: false,
         reason: "Not enough logged cycles to estimate ovulation. " + never };
     }
 
-    var confirmedOv = currentOvulation(cycles, opts);
-    var lut = lutealStats(cycles);
+    var found = currentOvulation(cycles, opts);
+    var conflict = found && !found.date ? found : null;
+    var confirmedOv = found && found.date ? found : null;
+    var lut = lutealStats(withOvulation(flagCycles(cycles, opts.events), opts.days));
     var lutealMean = lut ? posteriorFromStats(lut, LUTEAL_PRIOR).mean : LUTEAL_PRIOR.mean;
 
     // Distribution over the ovulation date: either a confirmed single day, or
     // the next-start curve walked back by the luteal length.
     var ovDist = [];
     if (confirmedOv) {
-      ovDist.push({ date: confirmedOv.date, p: 1 });
+      ovDist = ovulationDist(confirmedOv);
     } else {
       for (var i = 0; i < p.curve.length; i++) {
         ovDist.push({ date: addDays(p.curve[i].date, -Math.round(lutealMean)), p: p.curve[i].p });
@@ -636,10 +899,17 @@
       ovulation: confirmedOv
         ? { date: confirmedOv.date, source: confirmedOv.source }
         : (p.nextStart ? { date: addDays(p.nextStart, -Math.round(lutealMean)), source: "estimated" } : null),
-      confirmed: !!confirmedOv,
+      confirmed: isConfirmed(confirmedOv),
+      conflict: conflict ? { lh: conflict.lh, bbt: conflict.bbt } : null,
       reason: (confirmedOv
-        ? "Ovulation confirmed " + confirmedOv.date + ". "
-        : "Ovulation estimated from your predicted next start, so these bands are as uncertain as that prediction. ") + never
+        ? (isConfirmed(confirmedOv)
+            ? "Ovulation confirmed " + confirmedOv.date + " by " + (SOURCE_WORDS[confirmedOv.source] || "your log") + ". "
+            : "Ovulation detected around " + confirmedOv.date + " from " + SOURCE_WORDS[confirmedOv.source] +
+              " alone — one indirect signal, so the bands are spread across neighbouring days rather than pinned to one. ")
+        : conflict
+          ? "Your LH test points to " + conflict.lh + " and your temperature rise to " + conflict.bbt +
+            ": the signals disagree, so neither is used and ovulation is estimated from your predicted next start. "
+          : "Ovulation estimated from your predicted next start, so these bands are as uncertain as that prediction. ") + never
     };
   }
 
@@ -648,6 +918,9 @@
     fertility: fertility,
     history: history,
     detectOvulation: detectOvulation,
+    withOvulation: withOvulation,
+    flagCycles: flagCycles,
+    MODEL_VERSION: MODEL_VERSION,
     lutealStats: lutealStats,
     _loo: loo,                        // internal: Epok.Backtest is the public face
     MIN_CYCLES_TO_PREDICT: MIN_CYCLES_TO_PREDICT,

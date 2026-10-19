@@ -42,7 +42,7 @@
       mae: median(errs),
       n: rows.length,
       perCycle: rows.map(function (r) {
-        return { start: r.start, predicted: r.predicted, actual: r.actual, errorDays: r.errorDays };
+        return { start: r.start, predicted: r.predicted, actual: r.actual, errorDays: r.errorDays, window: r.window };
       })
     };
   }

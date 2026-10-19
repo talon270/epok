@@ -5,8 +5,9 @@ its own measured error, and a Swiss/terminal brutalist interface. Vanilla
 HTML/CSS/JS, no build step, no backend, no accounts. It opens straight from
 `file://` and stays fully usable that way — logging, prediction, encryption,
 export — everything except push reminders, which need a real origin (see
-Setup). Your log lives in this browser's `localStorage` and never leaves it
-unless you export it yourself.
+Setup). Your log lives in this browser's `localStorage` and leaves it only if
+you export it yourself or switch on **opt-in, end-to-end-encrypted sync** to a
+database you own (off by default — see *Optional sync*).
 
 **The one thing it must never get wrong: lose or misdate a logged day.**
 Months of history live in `localStorage`, the schema will change over time,
@@ -46,11 +47,12 @@ node tools/score.js               # the prediction engine's own proof — see be
 
 | View | What's there |
 |---|---|
-| **Today** | One-tap flow chips, period-start action (states the predicted-date change before it commits), the prediction card, BBT/LH quick entry, the full tag grid inline |
-| **Calendar** | Month grid: period days shaded by flow, fertile days and ovulation for every cycle (confirmed where BBT/LH says so), the predicted window as a dashed outline. Tapping a day shows it in a detail panel; LOG THIS DAY is what switches the logging date |
-| **Insights** | Cycle-length trend, a temperature chart with the detected ovulation shift marked, a symptom-by-cycle-day heatmap, gated pattern detection |
-| **Settings** | Profile (all skippable), contraception method and its reminder rules, PIN encryption, per-reminder checkboxes, palette/mode/day-boundary, tag hiding and custom tags, JSON/CSV export and import, Clue CSV import |
-| **Report** | One printable page for a clinician: cycle table, summary stats, top symptoms by phase, ovulation dates — headed "self-reported" |
+| **Today** | One-tap flow chips, period-start action (states the predicted-date change before it commits), the prediction card (paused with its reason during pregnancy, postpartum or an ovulation-suppressing method; marked EXPIRED once its window has passed), BBT/LH quick entry with time and a "disturbed" flag, the full tag grid with your own 1–3 severity, effect-on-day, a check-in chip, and one-tap events |
+| **Calendar** | **Month** or **3 months** (previous, current, next side by side; the page widens for it). Period days shaded by flow, fertile days and ovulation for every cycle, the predicted window as a dashed outline. Arrow keys move the selected day, PageUp/PageDown change month, `T` today, `1`/`3` the view, `L` logs the day, `?` lists them; a date box jumps anywhere; flow and check-in can be logged from the detail panel without leaving |
+| **Timeline** | Every cycle with where its start came from, length, bleeding, what was charted, and flags (long, short, inside a span). Move a start, leave a cycle out of the fit, add a missed start, or remove one — each states its consequence first and can be undone |
+| **Insights** | Overview, **forecast history** (each forecast epok actually showed, with the date it was made, why it changed, and the real start once it arrives), cycle-length trend, temperature chart, symptom heatmap, gated pattern detection with your own severity ratings |
+| **Settings** | Profile (all skippable), contraception method and its reminder rules, **events** (pregnancy, postpartum, breastfeeding, past methods, medication), PIN encryption, per-reminder checkboxes, palette/mode/day-boundary, tag hiding and custom tags, JSON/CSV export and import, Clue CSV import, **optional sync** |
+| **Report** | One printable page for a clinician, over a range you pick (3 / 6 / 12 months, everything, or two dates): summary, how complete the log is, cycles, prolonged-bleeding episodes, events, symptoms with self-rated severity and the basis for each phase — headed "self-reported" |
 
 Underneath: AES-GCM encryption with a forced backup before it turns on,
 offline install via a service worker, and a contraception rules table (21+7,
@@ -83,22 +85,34 @@ contract-shape assertions has regressed past its recorded bar.
 | `CYCLE-LEN` | Error when the model sees period starts only |
 | `LUTEAL` | Error when the BBT/LH chart is supplied, luteal phase generated at sd 1.3 days |
 | `LUT.STRESS` | The same, at luteal sd 2.5 — a person whose luteal phase is *not* stable |
+| `APP-SHAPED` | The `LUTEAL` charts with `cycle.ovulation` left empty, as the app stores it — past ovulation has to be *detected*. This is the column that says what a real log gets |
+| `window calibration` | How often the true start landed inside the printed 80% window, its width, signed bias, 90th-percentile error, and a recent-median baseline |
 | `live mode chosen` | Which mode the model picks on a full 20-cycle chart |
 | `change-point detector` | Detection rate, what it saves, and how often it fires wrongly |
 | `contract surface` | Refusal path, curve mass, window bracketing, ovulation and fertility shapes |
 
 ### Measured error
 
-`node tools/score.js --seeds 300`, run 2026-09-16. Each run is 20 synthetic cycles
+`node tools/score.js --seeds 300`, re-run 2026-10-03 after the fixes in `REVIEW-algorithm-2026-10-03.md`. Each run is 20 synthetic cycles
 scored leave-one-out, giving 16 predictions per run. Median absolute error in
 days, with the mean in brackets:
 
-| Cohort | Period starts only | With chart | With chart, unstable luteal |
-|---|---|---|---|
-| regular (28 ± 2) | 1.50 (1.68) | 1.00 (1.20) | 1.50 (1.82) |
-| pcos (bimodal, 24–45) | 5.00 (5.29) | 1.00 (2.44) | 2.25 (3.28) |
-| regime-shift (28 → 34 at cycle 8) | 2.00 (2.53) | 1.00 (1.17) | 2.00 (2.23) |
-| perimenopause (28 → 40, ~15% skipped) | 5.00 (8.21) | 1.00 (4.73) | 2.00 (5.64) |
+| Cohort | Period starts only | With chart | With chart, unstable luteal | App-shaped (mean only) |
+|---|---|---|---|---|
+| regular (28 ± 2) | 1.50 (1.68) | 1.00 (1.17) | 1.50 (1.78) | 1.17 |
+| pcos (bimodal, 24–45) | 5.00 (5.29) | 1.00 (2.34) | 2.00 (3.10) | 2.34 |
+| regime-shift (28 → 34 at cycle 8) | 2.00 (2.38) | 1.00 (1.17) | 2.00 (2.15) | 1.17 |
+| perimenopause (28 → 40, ~15% skipped) | 5.00 (8.22) | 1.00 (4.69) | 2.00 (5.58) | 4.69 |
+
+**The app-shaped column was wrong for three weeks and nobody could see it.** The
+generator hands the model each past cycle's true ovulation date; the app never
+does — chart entries do not write `cycle.ovulation`. Run with the field empty,
+luteal mode activated in 0 of 1,200 charted histories and the error was the
+period-starts-only figure (PCOS 5.29, perimenopause 8.21 against 2.34 and 4.69).
+Past ovulation is now derived from each closed cycle's own BBT/LH, and the
+app-shaped column matches `LUTEAL`. That equality is the fix being measured, and
+it also says how much of `LUTEAL` is the engine's detection and how much the
+generator's: none, once detection works.
 
 **These are synthetic cohorts, and the generator was written by the same window
 as the model.** They show the engine uses the structure it is given and loses
@@ -128,15 +142,28 @@ naming the floor.
 with a half-life of 6 cycles. Separately, if the last 3 cycles differ from
 everything before by both 2.5 standard errors and a flat 3 days, the older block
 is dropped and the card names the date the new pattern started. On the
-regime-shift cohort this fires on 93% of runs three cycles after the shift — the
+regime-shift cohort this fires on 86% of runs three cycles after the shift — the
 first point at which three post-shift cycles exist — and cuts mean error over
-the next six cycles from 4.20 to 3.54 days. False fires: 0.4% of 3,900 checks on
+the next six cycles from 4.20 to 3.48 days. False fires: 0.4% of 3,900 checks on
 the regular cohort.
+
+**A boundary stays where it was set.** The first detector re-ran its test on the
+whole record every time, so the boundary slid forward one cycle per new
+observation, and once the record was twice the window it stopped firing and every
+dropped cycle came back: eight 28-day cycles then 34-day ones fit 34 days at 15
+cycles and 32 at 16, on another identical 34. The detector now replays the record
+in order, and a boundary survives only if the cycles after it still differ from
+the ones before — held to 1.0 extra standard error once more than three cycles sit
+behind it. **That stability has a price, measured:** detection three cycles after
+a shift fell from 93% to 86%, and PCOS false fires rose from 2.3% to 5.3% of 3,900
+checks, because a noisy run that survives validation now stays in force instead of
+vanishing on the next call. The PCOS bar was moved from 3.5% to 6% to match; the
+old figure was low because the detector forgot.
 
 **Irregular is not the same as changed.** If you have declared PCOS or
 perimenopause, the detector needs 3.5 standard errors instead of 2.5, because
-irregularity is expected. Measured over 300 seeds, that cuts false fires on the
-PCOS cohort from 9.1% of 3,900 checks to 2.3%, with mean error 5.29 → 5.25 days. Telling someone with PCOS
+irregularity is expected. Measured over 300 seeds on the stateless detector, that cut false fires on the
+PCOS cohort from 9.1% of 3,900 checks to 2.3%, with mean error 5.29 → 5.25 days (5.3% on the replaying detector, above). Telling someone with PCOS
 that their cycles "changed" when they are simply irregular is a false finding.
 
 **One measurement is not certainty.** The first version put a floor under the
@@ -152,11 +179,12 @@ that varies (sd 2.5), picking whichever spread was narrower chose luteal mode on
 49% of predictions and was 0.54 days worse each time it did. Luteal mode now has to produce a predictive spread at least 15%
 narrower than the cycle-length fit, and ties go to cycle length because every
 cycle contributes a length while only charted cycles contribute a luteal
-measurement. That cuts luteal choices to 27% and the cohort's mean error from 1.94
-to 1.82 days. **It is still worse than ignoring the chart (1.68)** — the margin
-narrows the loss, it does not remove it, because the model cannot always tell a
-stable luteal phase from a lucky run of one. The `LUT.STRESS` column keeps that
-visible.
+measurement. That cut luteal choices from 49% to 27% and the cohort's mean error
+from 1.94 to 1.82 days (those two figures predate the as-of fix and were not
+re-measured). **It is still worse than ignoring the chart** — `LUT.STRESS` is
+1.78 against 1.68 for period starts only. The margin narrows the loss, it does not
+remove it, because the model cannot always tell a stable luteal phase from a lucky
+run of one.
 
 **Fertility is a set of per-day bands, never a window, and never "closed".**
 Uncertainty about the ovulation day is spread across a day-relative conception
@@ -171,18 +199,68 @@ contains "closed", "over", "safe" or "no longer fertile".
 |---|---|---|
 | LH positive | First positive test in the cycle | The day after the positive |
 | BBT 3-over-6 | Three consecutive readings above the highest of the previous six, the third at least 0.2 °C above | The day before the first high reading |
-| Both | Both rules fire | The LH-derived day, source `both` |
+| Both | Both rules fire **within 3 days of each other** | The LH-derived day, source `both` — the only combined result called *confirmed* |
+| Conflict | Both fire, more than 3 days apart | No date. Both are reported (`lh`, `bbt`), neither is used, and the card says the signals disagree |
 
 The BBT rule needs at least four readings in the six-day baseline and returns
-`null` rather than guessing when the chart is sparse. **Neither rule is used to
+`null` rather than guessing when the chart is sparse. The 0.2 °C threshold is
+compared in integer hundredths: 36.6 → 36.8 is `0.19999999999999574` in floating
+point and used to be missed, while 36.5 → 36.7 was caught.
+
+**One signal is "detected", not "confirmed".** A single LH strip or a single
+temperature shift spreads the ovulation date across neighbouring days (±1 for LH,
+±2 for temperature; weights are unsourced and wide on purpose) and the calendar
+draws it as an estimate. ASRM describes urinary LH as indirect evidence that can
+be falsely positive, and a temperature rise only shows ovulation after the fact. **Neither rule is used to
 say contraception is safe.** Detection feeds prediction only; full
 symptothermal rules with cervical fluid are out of scope (PLAN-epok.md).
+
+### What a forecast is allowed to see
+
+**A forecast reads only what was logged by its own date.** `predict` takes
+`opts.asOf`; the backtest sets it to the day before each period arrived. Before,
+an LH result dated inside the *next* cycle changed an earlier forecast from 25 Apr
+to 18 May and its recorded error from 1 day to 24, so the headline "±N days
+measured error" could depend on data from after the outcome. The same bound
+replaced the fixed 45-day scan of the open cycle, which both missed a late surge
+in a long cycle and let that leak.
+
+**An expired forecast says so.** When `asOf` is past the window's end and no
+period is logged, `expired` is true, the card is headed EXPIRED FORECAST, the
+calendar stops drawing the window, and reminders skip it. The model does not
+re-condition the curve on "no bleeding yet" — an empty log does not prove none.
+
+**An ovulation-suppressing method pauses the natural-cycle forecast.** Combined
+pill, patch, ring, injection, implant and continuous pill: bleeding on them is a
+scheduled or withdrawal bleed, so `predict` refuses (`paused: "contraception"`)
+and `fertility` returns no bands, with the reason on screen. Not paused: the
+progestogen-only pill (suppression is inconsistent) and IUDs (the method table
+does not yet separate hormonal from copper). **Known gap:** the table keeps only
+the current method, so cycles logged while on a method are counted again once it is
+set to NONE.
+
+### Window calibration
+
+`node tools/score.js --seeds 300`, app-shaped runs, nominal 80% window:
+
+| Cohort | Starts inside the window | Mean width | Signed bias | 90th-pct abs error | Recent-median baseline (mean abs) |
+|---|---|---|---|---|---|
+| regular | 87.7% | 3.6 d | −0.01 d | 2 d | 1.78 |
+| pcos | 83.0% | 6.5 d | −1.34 d | 7 d | 5.66 |
+| regime-shift | 87.9% | 3.6 d | −0.09 d | 2 d | 2.52 |
+| perimenopause | 78.3% | 6.3 d | −3.56 d | 20 d | 8.38 |
+
+These are measured, not gated, and they are for charted histories — the windows
+are narrower than the 5.7 / 13.9 / 7.2 / 22.0 days a period-starts-only forecast
+gets. **The window is not uniformly 80%:** perimenopause lands 78.3% inside with a
+20-day 90th-percentile miss, and the negative bias there means starts arrive later
+than forecast — skipped cycles, which nothing in a period-start history announces.
 
 ### Assumed vs solid
 
 | Solid — measured, rule-defined or sourced | Assumed — a knob in `js/model.js` |
 |---|---|
-| Leave-one-out error on every cohort, 300 seeds | Population prior sd 5.0 days — the mean is sourced, the sd is not confirmed |
+| Rolling-origin error on every cohort, 300 seeds (read only data logged before each forecast) | Population prior sd 5.0 days — the mean is sourced, the sd is not confirmed |
 | Change-point detection rate and false-fire rate | PCOS prior, 36.5 ± 9.0 days — **no source** |
 | Luteal mode's gain, and its loss when the luteal phase is unstable | Perimenopause prior, 33.0 ± 11.0 days — **no source** |
 | Node and browser give byte-identical output (Playwright, `file://`) | Luteal prior, 13.5 ± 2.0 days — between two sources, matches neither |
@@ -225,6 +303,73 @@ data giving mean cycle lengths in the years before the final period. Its figures
 could not be traced to a reachable page, so they are not cited here and do not
 feed the model.
 <!-- END engine · Window B -->
+
+## Optional sync
+
+**Sync is off until you finish a form, and the app never needs it.** `js/sync.js`
+keeps an encrypted copy of the log in a [Turso](https://turso.tech) database that
+you create and own, so a second device can read it. The local `localStorage`
+state stays the source of truth: with sync off, offline, or the database gone,
+nothing changes about logging, prediction or export.
+
+**What the database can see, and what it cannot.**
+
+| The database can see | The database cannot see |
+|---|---|
+| That rows exist, how many, and when each was last written | Any date, flow level, symptom, temperature, note or tag |
+| Ciphertext (AES-GCM) and keyed hashes | Which rows are days and which are lists, beyond a `day` / `blob` label |
+| Your token's requests | Your passphrase — it never leaves the browser and is not stored |
+
+Every record is encrypted in the browser with a key derived from a passphrase
+(PBKDF2, 250,000 iterations, the same floor as the PIN lock). Record ids are keyed
+hashes, so the database cannot list your dates. **Lose the passphrase and the
+uploaded copy cannot be opened by anyone, including you** — your local log is
+unaffected, and setup makes you tick that you understand.
+
+**The token is stored in this browser only.** It is not inside the PIN-sealed
+state, not in a JSON backup, and not in the repo; `tools/verify.py` fails if a
+JWT-shaped string appears in `js/` or the deploy copy. A token compiled into a
+public static site would be a token anyone could read — which is why there is no
+config file and the page asks you to paste it.
+
+### The things most sync gets wrong
+
+**A change on one side only is not a conflict.** Each record is merged three
+ways against what was last synced, so an edit made on one device simply arrives
+on the other. Only a record changed on *both* since the last sync is a conflict;
+the newer edit wins and the other version is kept in a list under Settings → Sync,
+and `epok.state.prev` holds the local state a pull overwrote.
+
+**A device that has never synced does not get to "change" anything.** The first
+version of the join logic let a fresh device's empty cycles list count as a local
+edit, stamp it later than the other device's upload, and win — replacing a real
+log with nothing. An untouched default now never counts as a change on a
+device's first sync. Found by running two browser contexts, not by reading.
+
+**An empty database is not "everything was deleted".** If the database loses its
+salt row (reset, recreated, wrong database) the sync stops and changes nothing
+locally, and a pull that would delete more than half your logged days (and more
+than 10) is refused with the numbers. Both exist because the alternative erases
+months of log on the strength of one unreachable server.
+
+**An unreachable database is said plainly.** A failed sync shows a banner with
+the age of the last good one and never presents old data as current. Edits keep
+being tracked while sync is paused, so resuming does not stamp an old edit as
+new and let it beat a newer one made elsewhere.
+
+### Assumed vs solid — sync
+
+| Solid — exercised in `tools/verify.py sync` | Assumed — not verified |
+|---|---|
+| Join from a second device, wrong passphrase refused before any upload, one-sided edits merge without conflict, a two-sided edit keeps the newer and lists the other | **That a browser can call a real Turso endpoint** (CORS), and that it accepts exactly the `/v2/pipeline` request `js/sync.js` sends. The tests run against `tools/mock_turso.py`, which is **not** Turso |
+| The database holds no readable note, tag or date | Last-writer-wins relies on both devices' clocks agreeing to within the gap between two edits |
+| Offline, locked-session, reset-database and delete-the-copy behaviour | Cycles, events and profile fields sync as whole lists, so two devices that both edited the same list lose the older edit (listed, not merged) |
+| The token is in neither the export nor the state | Turso's free-tier limits and the token's lifetime |
+
+To try it for real: create a database and a token with `turso db create` /
+`turso db tokens create`, paste the URL and token into Settings → Sync, and if
+the browser reports it could not reach the database, that is the CORS question
+above, answered. `PLAN-features-sync.md § C0` is the checklist.
 
 ## The interface
 
@@ -302,7 +447,8 @@ and refuses if `PLAN-epok.md`, `CONTRACTS.md`, `STATUS.md`, or anything under
 `tools/` ever lands in the copy. `deploy/wrangler.jsonc` targets Cloudflare
 Pages as static assets only — no Worker, no password — because the only
 thing that becomes public is the code; the log itself never leaves the
-browser it was typed into. `deploy/` is not a git repository and nothing here
+browser it was typed into — unless you turn on sync, in which case only ciphertext
+leaves it (see *Optional sync*). `deploy/` is not a git repository and nothing here
 commits or pushes on its own: `./deploy.sh --push` runs `npx wrangler deploy`
 after copying, and a plain `./deploy.sh` just copies and reports.
 

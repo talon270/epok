@@ -4,15 +4,16 @@
 
      · PRECACHE   the whole shell on install, so the first offline open works
      · SERVE      cache-first, revalidating in the background
-     · NEVER      caches state. The log lives in localStorage and never
-                  touches the network; there is nothing here to leak.
+     · NEVER      caches state. The log lives in localStorage. Opt-in sync
+                  (js/sync.js) talks to the user's own database with POSTs, which
+                  this worker never intercepts — it only answers same-origin GETs.
 
    Bump CACHE whenever a shell file changes, or the old one is served forever.
    ========================================================================== */
 
 "use strict";
 
-var CACHE = "epok-v1";
+var CACHE = "epok-v4";
 
 /* Everything the app needs to open with the network gone. Window B's and
    Window C's files are listed here too — a missing one is a blank view
@@ -30,12 +31,14 @@ var SHELL = [
   "js/crypto.js",
   "js/tags.data.js",
   "js/contraception.data.js",
+  "js/sync.js",
   "js/model.js",
   "js/backtest.js",
   "js/import-clue.js",
   "js/reminders.js",
   "js/views/today.js",
   "js/views/calendar.js",
+  "js/views/timeline.js",
   "js/views/insights.js",
   "js/views/settings.js",
   "js/views/report.js",
@@ -54,8 +57,9 @@ self.addEventListener("install", function (e) {
 });
 
 self.addEventListener("activate", function (e) {
+  /* Only this app's caches: every app on talon270.github.io shares one CacheStorage, and deleting the rest took their offline copies with it. */
   e.waitUntil(caches.keys().then(function (keys) {
-    return Promise.all(keys.map(function (k) { return k === CACHE ? null : caches.delete(k); }));
+    return Promise.all(keys.map(function (k) { return k === CACHE || k.indexOf("epok-") !== 0 ? null : caches.delete(k); }));
   }).then(function () { return self.clients.claim(); }));
 });
 
