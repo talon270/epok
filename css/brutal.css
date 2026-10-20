@@ -14,7 +14,7 @@
   --font-mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
 
   /* Extreme scale contrast is the whole look: micro-labels against big numbers. */
-  --t-micro: 11px;    /* uppercase, 0.12em tracking */
+  --t-micro: 12px;    /* uppercase, 0.12em tracking; 11px fell under the 12px legibility floor */
   --t-small: 12px;
   --t-body: 14px;
   --t-head: 20px;
